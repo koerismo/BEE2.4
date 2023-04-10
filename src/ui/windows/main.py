@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
 	QWidget,
 	QHBoxLayout,
 	QVBoxLayout,
+	QLabel,
+	QLineEdit,
 
 	QScrollArea,
 	QGridLayout,
@@ -29,41 +31,57 @@ class BeeWindowMain(QWidget):
 
 		# Shitty hack to prevent window from growing vertically
 		self.setMaximumHeight(0)
+		self.resize(600, 500)
 
-		# Begin window initialization
+		# Initialize window
 		self.setWindowTitle('BEEMOD [Qt] 2.4.43.0 64-bit - Portal 2')
 		layout = QHBoxLayout(self)
 
-		grid_left = QGridLayout()
-		layout.addLayout(grid_left)
+		# Left/right layouts
+		layout_l = QVBoxLayout()
+		layout_r = QVBoxLayout()
+		layout.addLayout(layout_l)
+		layout.addLayout(layout_r)
 
-		scroll_right = QScrollArea()
-		scroll_right.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-		scroll_right.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-		scroll_right.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
+		# Left-side header
+		layout_l.addWidget(QLabel('ITEMS'))
 
-		grid_right = QGridLayout()
-		grid_right_container = QWidget()
-		grid_right_container.setLayout(grid_right)
-		scroll_right.setWidget(grid_right_container)
-		layout.addWidget(scroll_right)
+		# Right-side header
+		header_r = QHBoxLayout()
+		layout_r.addLayout(header_r)
+		header_r.addWidget(QLabel('SEARCH'))
+		header_r.addWidget(QLineEdit())
 
-		grid_left.setSpacing(2)
-		grid_left.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-		grid_right.setSpacing(2)
-		grid_right.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+		# Left-side grid
+		grid_l = QGridLayout()
+		layout_l.addLayout(grid_l)
+		grid_l.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+		grid_l.setSpacing(2)
 
+		# Right-side scroll area
+		scroll = QScrollArea()
+		layout_r.addWidget(scroll)
+		scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+		scroll.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
+		scroll_widget = QWidget(scroll)
+		scroll.setWidget(scroll_widget)
+
+		# Right-side grid
+		grid_r = QGridLayout(scroll_widget)
+		grid_r.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+		grid_r.setSpacing(2)
+
+		# Fill everything with dummy slots
 		slot_colors = QPalette()
 		slot_colors.setColor(QPalette.ColorRole.Window, '#ddd')
 
-		# Add dummy spaces
 		for y in range(8):
 			for x in range(4):
 				widget = QWidget(self)
 				widget.setAutoFillBackground(True)
 				widget.setPalette(slot_colors)
 				widget.setFixedSize(64, 64)
-				grid_left.addWidget(widget, y, x)
+				grid_l.addWidget(widget, y, x)
 
 		for y in range(16):
 			for x in range(4):
@@ -71,4 +89,4 @@ class BeeWindowMain(QWidget):
 				widget.setAutoFillBackground(True)
 				widget.setPalette(slot_colors)
 				widget.setFixedSize(64, 64)
-				grid_right.addWidget(widget, y, x)
+				grid_r.addWidget(widget, y, x)
