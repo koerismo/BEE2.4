@@ -1,28 +1,30 @@
+from PySide6.QtCore import QSize, QRect, Qt
 from PySide6.QtWidgets import QLayout, QWidget, QLayoutItem
-from PySide6 import QtCore, QtGui
-from typing import Optional
+from typing import Optional, List
 from math import ceil
 
-class QFlowGridLayout(QLayout):
-	''' Defines a wrapping grid-like container. Adapted to Python from
-		https://doc.qt.io/qt-5/qtwidgets-layouts-flowlayout-example.html '''
 
-	def __init__(self, itemSize: int, parent: Optional[QWidget] = None, margin: int=0, spacing: int=0) -> None:
+class QFlowGridLayout(QLayout):
+	""" Defines a wrapping grid-like container. Adapted to Python from
+		https://doc.qt.io/qt-5/qtwidgets-layouts-flowlayout-example.html """
+
+	def __init__(self, itemSize: int, parent: Optional[QWidget] = None, margin: int = 0, spacing: int = 0) -> None:
 		super().__init__(parent)
-		self.itemList: list[QLayoutItem] = []
+		self.itemList: List[QLayoutItem] = []
 		self.itemSize = itemSize
 
 		self.setSpacing(spacing)
 		self.setContentsMargins(margin, margin, margin, margin)
 
-	def addItem(self, item: QLayoutItem):
+	def addItem(self, item: QLayoutItem) -> None:
 		self.itemList.append(item)
 
 	def count(self) -> int:
 		return len(self.itemList)
 
-	def itemAt(self, index: int) -> QLayoutItem|None:
-		if index < 0 or index >= len(self.itemList): return None
+	def itemAt(self, index: int) -> Optional[QLayoutItem]:
+		if index < 0 or index >= len(self.itemList):
+			return None
 		return self.itemList[index]
 
 	def takeAt(self, index: int) -> QLayoutItem:
@@ -31,9 +33,8 @@ class QFlowGridLayout(QLayout):
 	def hasHeightForWidth(self) -> bool:
 		return True
 
-	def getTableDimensions(self, width: int):
-		# print(width)
-		''' Calculates the number of columns and rows for the given width. '''
+	def getTableDimensions(self, width: int) -> QSize:
+		""" Calculates the number of columns and rows for the given width. """
 
 		# Apply margins
 		left, _, right, _ = self.getContentsMargins()
@@ -45,7 +46,7 @@ class QFlowGridLayout(QLayout):
 		rows = ceil(len(self.itemList) / columns)
 
 		# Return plain
-		return QtCore.QSize(columns, rows)
+		return QSize(columns, rows)
 
 	def heightForWidth(self, width: int) -> int:
 
@@ -61,20 +62,20 @@ class QFlowGridLayout(QLayout):
 		# Determine height from rows + margins
 		return (self.itemSize + spacing) * rows - spacing + top + bottom
 
-	def expandingDirections(self) -> QtCore.Qt.Orientation:
-		return QtCore.Qt.Orientation.Horizontal
+	def expandingDirections(self) -> Qt.Orientation:  # type: ignore
+		return Qt.Orientation.Horizontal
 
-	def setGeometry(self, rect: QtCore.QRect) -> None:
+	def setGeometry(self, rect: QRect) -> None:
 		super().setGeometry(rect)
 		self.doLayout(rect)
 
-	def minimumSize(self) -> QtCore.QSize:
-		return QtCore.QSize(self.itemSize,self.itemSize).grownBy(self.contentsMargins())
+	def minimumSize(self) -> QSize:
+		return QSize(self.itemSize, self.itemSize).grownBy(self.contentsMargins())
 
-	def sizeHint(self) -> QtCore.QSize:
+	def sizeHint(self) -> QSize:
 		return self.minimumSize()
 
-	def doLayout(self, rect: QtCore.QRect):
+	def doLayout(self, rect: QRect) -> None:
 		# Compared to the example, this runs a much more naive algorithm that assumes all children are the same dimensions.
 		# This is partially for faster speeds, but mostly because I am lazy.
 
@@ -86,6 +87,6 @@ class QFlowGridLayout(QLayout):
 		for ind, item in enumerate(self.itemList):
 			col = ind % columns
 			row = (ind - col) // columns
-			x = (self.itemSize+spacing) * col
-			y = (self.itemSize+spacing) * row
-			item.setGeometry(QtCore.QRect(x+left, y+top, self.itemSize, self.itemSize))
+			x = (self.itemSize + spacing) * col
+			y = (self.itemSize + spacing) * row
+			item.setGeometry(QRect(x + left, y + top, self.itemSize, self.itemSize))
