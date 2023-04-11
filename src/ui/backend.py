@@ -1,24 +1,23 @@
-''' ui/backend_.py
-	Defines a generic backend type for BEE's interface. '''
+""" ui/backend_.py
+	Defines a generic backend type for BEE's interface. """
+import abc
 
-class BeeGenericBackend():
-	''' Defines a generic backend type for BEE's interface. '''
 
-	def __init__(self) -> None:
-		pass
+class BeeGenericBackend(metaclass=abc.ABCMeta):
+	""" Defines a generic backend type for BEE's interface. """
 
-	def version() -> str:
-		''' Returns the current application's version as a string. '''
-		raise NotImplementedError()
+	@abc.abstractmethod
+	def version(self) -> str:
+		""" Returns the current application's version as a string. """
 
-	def read_config():
-		''' Reads and returns the current application configuration. '''
-		raise NotImplementedError()
+	@abc.abstractmethod
+	def read_config(self) -> dict:
+		""" Reads and returns the current application configuration. """
 
-	def write_config():
-		''' Writes the provided object to the application configuration. '''
-		raise NotImplementedError()
+	@abc.abstractmethod
+	def write_config(self, cfg: dict) -> None:
+		""" Writes the provided object to the application configuration. """
 
-	def read_packages():
-		''' Writes the provided object to the application configuration. '''
-		raise NotImplementedError()
+	@abc.abstractmethod
+	def read_packages(self):
+		""" Writes the provided object to the application configuration. """
