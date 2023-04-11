@@ -37,9 +37,6 @@ class BeeWindowMain(QWidget):
 		self.backend = backend
 		self.layout = QVBoxLayout(self)
 		self.layout.setContentsMargins(0,0,0,0)
-
-		# Shitty hack to prevent window from growing vertically
-		self.setMaximumHeight(0)
 		self.resize(650, 500)
 
 		# Set background color
@@ -65,7 +62,7 @@ class BeeWindowMain(QWidget):
 		# Initialize window
 		self.setWindowTitle('BEEMOD [Qt] 2.4.43.0 64-bit - Portal 2')
 		layout = QHBoxLayout()
-		layout.setContentsMargins(5,0,5,5)
+		layout.setContentsMargins(5,5,5,5)
 		self.layout.addLayout(layout)
 
 		# Define widget theme
@@ -82,6 +79,9 @@ class BeeWindowMain(QWidget):
 		layout.addWidget(widget_r)
 		layout_l = QVBoxLayout(widget_l)
 		layout_r = QVBoxLayout(widget_r)
+
+		# Prevent left-side widget from growing
+		layout_l.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
 
 		# Fill widget backgrounds
 		widget_l.setPalette(widget_colors)
@@ -101,27 +101,19 @@ class BeeWindowMain(QWidget):
 		# Left-side grid
 		grid_l = QGridLayout()
 		layout_l.addLayout(grid_l)
-		grid_l.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
 		grid_l.setSpacing(2)
 
 		# Right-side scroll area
-		scroll = QScrollArea()
-		layout_r.addWidget(scroll)
-		scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-		scroll.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
-		scroll_widget = QWidget(scroll)
-		scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Maximum)
-		scroll.setWidget(scroll_widget)
+		scroll_container = QScrollArea()
+		layout_r.addWidget(scroll_container)
+		scroll_container.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+		scroll_container.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
+		scroll_widget = QWidget(scroll_container)
+		scroll_container.setWidget(scroll_widget)
+		scroll_container.setWidgetResizable(True)
 
 		# Right-side grid
-		grid_r = QFlowGridLayout(64, None, 10, 2)
-		scroll_widget.setLayout(grid_r)
-		# scroll_widget.setStyleSheet('''background-color: #f00''')
-		# scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
-		# scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Maximum)
-		scroll_widget.setMinimumWidth(400)
-		scroll_widget.setMinimumHeight(200)
-		# grid_r.setSizeConstraint(QLayout.SizeConstraint.SetMaximumSize)
+		grid_r = QFlowGridLayout(64, scroll_widget, 10, 2)
 
 		# Fill everything with dummy slots
 		slot_colors = QPalette()
