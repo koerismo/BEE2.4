@@ -1,13 +1,11 @@
-''' ui/windows/main.py
-	This file defines the main window. '''
+""" ui/windows/main.py
+	This file defines the main window. """
+from typing import Optional
 
 # Application backend type
 from ..backend import BeeGenericBackend
 
 # Qt UI framework
-from PySide6 import QtCore, QtGui, QtWidgets
-
-# Qt UI framework shortcuts
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
@@ -18,6 +16,7 @@ from PySide6.QtWidgets import (
 	QLabel,
 	QLineEdit,
 
+	QScrollBar,
 	QScrollArea,
 	QGridLayout,
 	QLayout,
@@ -29,14 +28,16 @@ from PySide6.QtWidgets import (
 # Custom UI component for item listing
 from ..shared.flow import QFlowGridLayout
 
-class BeeWindowMain(QWidget):
-	''' The primary window, with palette selection. '''
 
-	def __init__(self, backend: BeeGenericBackend, parent: QWidget=None, window_type: Qt.WindowType=Qt.WindowType.Window):
-		super().__init__(parent, window_type)
+class BeeWindowMain(QWidget):
+	""" The primary window, with palette selection. """
+	backend: BeeGenericBackend
+
+	def __init__(self, backend: BeeGenericBackend, parent: Optional[QWidget] = None, window_type: Qt.WindowType = Qt.WindowType.Window):
+		super().__init__( parent=parent, window_type=window_type )  # type: ignore
 		self.backend = backend
-		self.layout = QVBoxLayout(self)
-		self.layout.setContentsMargins(0,0,0,0)
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(0, 0, 0, 0)
 		self.resize(650, 500)
 
 		# Set background color
@@ -46,7 +47,7 @@ class BeeWindowMain(QWidget):
 
 		# Menu
 		bar = QMenuBar()
-		self.layout.addWidget(bar)
+		layout.addWidget(bar)
 
 		m_file = QMenu('File')
 		m_edit = QMenu('Edit')
@@ -61,22 +62,22 @@ class BeeWindowMain(QWidget):
 
 		# Initialize window
 		self.setWindowTitle('BEEMOD [Qt] 2.4.43.0 64-bit - Portal 2')
-		layout = QHBoxLayout()
-		layout.setContentsMargins(5,5,5,5)
-		self.layout.addLayout(layout)
+		hbox = QHBoxLayout()
+		hbox.setContentsMargins(5, 5, 5, 5)
+		layout.addLayout(hbox)
 
 		# Define widget theme
 		widget_colors = QPalette()
-		widget_colors.setColor(QPalette.ColorRole.Window, '#fff')		# Background
-		widget_colors.setColor(QPalette.ColorRole.WindowText, '#222')	# Border
+		widget_colors.setColor(QPalette.ColorRole.Window, '#fff')      # Background
+		widget_colors.setColor(QPalette.ColorRole.WindowText, '#222')  # Border
 
 		# Left/right widgets and layouts
 		widget_l = QFrame()
 		widget_r = QFrame()
 		widget_l.setFrameShape(QFrame.Shape.Box)
 		widget_r.setFrameShape(QFrame.Shape.Box)
-		layout.addWidget(widget_l)
-		layout.addWidget(widget_r)
+		hbox.addWidget(widget_l)
+		hbox.addWidget(widget_r)
 		layout_l = QVBoxLayout(widget_l)
 		layout_r = QVBoxLayout(widget_r)
 
@@ -107,7 +108,7 @@ class BeeWindowMain(QWidget):
 		scroll_container = QScrollArea()
 		layout_r.addWidget(scroll_container)
 		scroll_container.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-		scroll_container.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
+		scroll_container.setVerticalScrollBar(QScrollBar(Qt.Orientation.Vertical))
 		scroll_widget = QWidget(scroll_container)
 		scroll_container.setWidget(scroll_widget)
 		scroll_container.setWidgetResizable(True)
@@ -134,3 +135,5 @@ class BeeWindowMain(QWidget):
 				widget.setPalette(slot_colors)
 				widget.setFixedSize(64, 64)
 				grid_r.addWidget(widget)
+
+		self.setLayout( layout )
