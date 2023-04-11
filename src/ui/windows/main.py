@@ -26,6 +26,9 @@ from PySide6.QtWidgets import (
 	QMenu,
 )
 
+# Custom UI component for item listing
+from ..shared.flow import QFlowGridLayout
+
 class BeeWindowMain(QWidget):
 	''' The primary window, with palette selection. '''
 
@@ -87,9 +90,7 @@ class BeeWindowMain(QWidget):
 		widget_r.setAutoFillBackground(True)
 
 		# Left-side header
-		header_text_l = QLabel('Items')
-		header_text_l.setPalette(QPalette())
-		layout_l.addWidget(header_text_l)
+		layout_l.addWidget(QLabel('Items'))
 
 		# Right-side header
 		header_r = QHBoxLayout()
@@ -109,12 +110,18 @@ class BeeWindowMain(QWidget):
 		scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
 		scroll.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
 		scroll_widget = QWidget(scroll)
+		scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Maximum)
 		scroll.setWidget(scroll_widget)
 
 		# Right-side grid
-		grid_r = QGridLayout(scroll_widget)
-		grid_r.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-		grid_r.setSpacing(2)
+		grid_r = QFlowGridLayout(64, None, 10, 2)
+		scroll_widget.setLayout(grid_r)
+		# scroll_widget.setStyleSheet('''background-color: #f00''')
+		# scroll_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
+		# scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Maximum)
+		scroll_widget.setMinimumWidth(400)
+		scroll_widget.setMinimumHeight(200)
+		# grid_r.setSizeConstraint(QLayout.SizeConstraint.SetMaximumSize)
 
 		# Fill everything with dummy slots
 		slot_colors = QPalette()
@@ -134,4 +141,4 @@ class BeeWindowMain(QWidget):
 				widget.setAutoFillBackground(True)
 				widget.setPalette(slot_colors)
 				widget.setFixedSize(64, 64)
-				grid_r.addWidget(widget, y, x)
+				grid_r.addWidget(widget)

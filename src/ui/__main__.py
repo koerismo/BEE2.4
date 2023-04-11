@@ -9,4 +9,5 @@ class BeeDummyBackend(BeeGenericBackend): pass
 # Start app
 test_backend = BeeDummyBackend()
 test_app = BeeApplication(backend=test_backend)
+# test_app.setStyle('fusion')
 test_app.exec()
