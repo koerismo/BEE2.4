@@ -3,8 +3,10 @@
 
 from . import BeeApplication, BeeGenericBackend
 
+# Create dummy API
 class BeeDummyBackend(BeeGenericBackend): pass
 
+# Start app
 test_backend = BeeDummyBackend()
 test_app = BeeApplication(backend=test_backend)
 test_app.exec()
