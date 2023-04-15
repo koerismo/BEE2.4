@@ -4,10 +4,11 @@
 from . import BeeApplication, BeeGenericBackend
 
 # Create dummy API
-class BeeDummyBackend(BeeGenericBackend): pass
+class BeeDummyBackend(BeeGenericBackend):
+	def version(self) -> str:
+		return 'v0.0.1'
 
 # Start app
 test_backend = BeeDummyBackend()
-test_app = BeeApplication(backend=test_backend)
-# test_app.setStyle('fusion')
+test_app = BeeApplication(test_backend)
 test_app.exec()

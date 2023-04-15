@@ -5,9 +5,6 @@
 from ..backend import BeeGenericBackend
 
 # Qt UI framework
-from PySide6 import QtCore, QtGui, QtWidgets
-
-# Qt UI framework shortcuts
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
@@ -19,6 +16,7 @@ from PySide6.QtWidgets import (
 	QLineEdit,
 
 	QScrollArea,
+	QScrollBar,
 	QGridLayout,
 	QLayout,
 
@@ -32,12 +30,15 @@ from ..shared.flow import QFlowGridLayout
 class BeeWindowMain(QWidget):
 	''' The primary window, with palette selection. '''
 
-	def __init__(self, backend: BeeGenericBackend, parent: QWidget=None, window_type: Qt.WindowType=Qt.WindowType.Window):
-		super().__init__(parent, window_type)
+	backend: BeeGenericBackend
+
+	def __init__(self, backend: BeeGenericBackend, parent: QWidget=None, flags: Qt.WindowType=Qt.Window):
+		super().__init__(parent, flags) # type: ignore
 		self.backend = backend
-		self.layout = QVBoxLayout(self)
-		self.layout.setContentsMargins(0,0,0,0)
 		self.resize(650, 500)
+
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(0, 0, 0, 0)
 
 		# Set background color
 		win_colors = QPalette()
@@ -46,7 +47,7 @@ class BeeWindowMain(QWidget):
 
 		# Menu
 		bar = QMenuBar()
-		self.layout.addWidget(bar)
+		layout.addWidget(bar)
 
 		m_file = QMenu('File')
 		m_edit = QMenu('Edit')
@@ -61,9 +62,9 @@ class BeeWindowMain(QWidget):
 
 		# Initialize window
 		self.setWindowTitle('BEEMOD [Qt] 2.4.43.0 64-bit - Portal 2')
-		layout = QHBoxLayout()
-		layout.setContentsMargins(5,5,5,5)
-		self.layout.addLayout(layout)
+		hbox = QHBoxLayout()
+		hbox.setContentsMargins(5, 5, 5, 5)
+		layout.addLayout(hbox)
 
 		# Define widget theme
 		widget_colors = QPalette()
@@ -75,8 +76,8 @@ class BeeWindowMain(QWidget):
 		widget_r = QFrame()
 		widget_l.setFrameShape(QFrame.Shape.Box)
 		widget_r.setFrameShape(QFrame.Shape.Box)
-		layout.addWidget(widget_l)
-		layout.addWidget(widget_r)
+		hbox.addWidget(widget_l)
+		hbox.addWidget(widget_r)
 		layout_l = QVBoxLayout(widget_l)
 		layout_r = QVBoxLayout(widget_r)
 
@@ -107,7 +108,7 @@ class BeeWindowMain(QWidget):
 		scroll_container = QScrollArea()
 		layout_r.addWidget(scroll_container)
 		scroll_container.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-		scroll_container.setVerticalScrollBar(QtWidgets.QScrollBar(Qt.Orientation.Vertical))
+		scroll_container.setVerticalScrollBar(QScrollBar(Qt.Orientation.Vertical))
 		scroll_widget = QWidget(scroll_container)
 		scroll_container.setWidget(scroll_widget)
 		scroll_container.setWidgetResizable(True)
