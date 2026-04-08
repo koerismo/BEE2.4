@@ -1,42 +1,44 @@
 """Handles Aperture Tag modifications in the compiler."""
+from __future__ import annotations
+
 import itertools
 import math
 import os
-from typing import Optional
 
 from precomp.connections import Item
-from srctools import Vec, Property, VMF, Entity, Output, Angle, Matrix
+from srctools import FrozenAngle, Vec, Keyvalues, VMF, Entity, Output, Angle, Matrix
 import srctools.logger
 
 from precomp import instanceLocs, options, connections, conditions
 from connections import Config
 from precomp.fizzler import FIZZLERS, FIZZ_TYPES, Fizzler
 import utils
-import vbsp
 
 
-COND_MOD_NAME = None
+COND_MOD_NAME: str | None = None
 
 LOGGER = srctools.logger.get_logger(__name__)
 
 # Fizzler type ID for Gel Gun Activator.
-TAG_FIZZ_ID = 'TAG_GEL_GUN'
+TAG_FIZZ_ID = utils.obj_id('TAG_GEL_GUN')
 # Special version with gel logic.
 TRANSITION_ENTS = 'instances/bee2/transition_ents_tag.vmf'
+FIZZLER_CONN_ID = utils.special_id('<TAG_FIZZER>')
 
 
 @conditions.make_result('ATLAS_SpawnPoint')
-def res_make_tag_coop_spawn(vmf: VMF, info: conditions.MapInfo, inst: Entity, res: Property) -> object:
+def res_make_tag_coop_spawn(vmf: VMF, info: conditions.MapInfo, inst: Entity, res: Keyvalues) -> object:
     """Create the spawn point for ATLAS in the entry corridor.
 
-    It produces either an instance or the normal spawn entity. This is required since ATLAS may need to have the paint gun logic.
-    The two parameters `origin` and `angles` must be set to determine the required position, or `facing` can be set for older files.
-    If `global` is set, the spawn point will be absolute instead of relative to the current instance.
+    It produces either an instance or the normal spawn entity. This is required since ATLAS may
+    need to have the paint gun logic. The two parameters `origin` and `angles` must be set to
+    determine the required position, or `facing` can be set for older files. If `global` is set,
+    the spawn point will be absolute instead of relative to the current instance.
     """
     if not info.is_coop:
         return conditions.RES_EXHAUSTED
 
-    is_tag = options.get(str, 'game_id') == utils.STEAM_IDS['TAG']
+    is_tag = options.GAME_ID() == utils.STEAM_IDS['TAG']
 
     origin = Vec.from_str(inst.fixup.substitute(res['origin', '0 0 0']))
     if 'angles' in res:
@@ -90,8 +92,8 @@ def res_make_tag_coop_spawn(vmf: VMF, info: conditions.MapInfo, inst: Entity, re
     return conditions.RES_EXHAUSTED
 
 
-@conditions.meta_cond(priority=200, only_once=True)
-def ap_tag_modifications(vmf: VMF):
+@conditions.MetaCond.ApertureTag.register
+def ap_tag_modifications(vmf: VMF, info: conditions.MapInfo) -> None:
     """Perform modifications for Aperture Tag.
 
     * Paint is always present in every map!
@@ -99,21 +101,19 @@ def ap_tag_modifications(vmf: VMF):
     * In singleplayer, override the transition ent instance to have the Gel Gun.
     * Create subdirectories with the user's steam ID to fix a workshop compile bug.
     """
-    if options.get(str, 'game_id') != utils.STEAM_IDS['APTAG']:
+    if options.GAME_ID() != utils.STEAM_IDS['APTAG']:
         return  # Wrong game!
 
     LOGGER.info('Performing Aperture Tag modifications...')
 
-    has = vbsp.settings['has_attr']
-    # This will enable the PaintInMap property.
-    has['Gel'] = True
+    # This will enable the PaintInMap keyvalue.
+    info.set_attr('Gel')
 
     # Set as if the player spawned with no pgun
-    has['spawn_dual'] = False
-    has['spawn_single'] = False
-    has['spawn_nogun'] = True
+    info.unset_attr('spawn_dual')
+    info.set_attr('spawn_single', 'spawn_nogun')
 
-    transition_ents = instanceLocs.get_special_inst('transitionents')
+    transition_ents = instanceLocs.resolve_filter('[transitionents]')
     for inst in vmf.by_class['func_instance']:
         if inst['file'].casefold() in transition_ents:
             inst['file'] = TRANSITION_ENTS
@@ -138,15 +138,18 @@ def ap_tag_modifications(vmf: VMF):
             )
 
 
-@conditions.make_result('TagFizzler')
-def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> conditions.ResultCallable:
+@conditions.make_result(
+    'TagFizzler',
+    valid_before=[conditions.MetaCond.Fizzler, conditions.MetaCond.Connections],
+)
+def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Keyvalues) -> conditions.ResultCallable:
     """Add an Aperture Tag Paint Gun activation fizzler.
 
     These fizzlers are created via signs, and work very specially.
-    This must be before -250 so it runs before fizzlers and connections.
+    This must be before -250 so that it runs before fizzlers and connections.
     """
     if 'ioconf' in res:
-        fizz_conn_conf = Config.parse('<TAG_FIZZER>', res.find_key('ioconf'))
+        fizz_conn_conf = Config.parse(FIZZLER_CONN_ID, res.find_key('ioconf'))
     else:
         fizz_conn_conf = None
 
@@ -160,16 +163,15 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
     oran_sign_on = res['oran_sign', '']
     oran_sign_off = res['oran_off_sign', '']
 
-    import vbsp
-    if options.get(str, 'game_id') != utils.STEAM_IDS['TAG']:
+    if options.GAME_ID() != utils.STEAM_IDS['TAG']:
         # Abort - TAG fizzlers shouldn't appear in any other game!
         # So simply remove the fizzler when called.
         return Entity.remove
 
     def make_tag_fizz(inst: Entity) -> None:
         """Create the Tag fizzler."""
-        fizzler: Optional[Fizzler] = None
-        fizzler_item: Optional[Item] = None
+        fizzler: Fizzler | None = None
+        fizzler_item: Item | None = None
 
         # Look for the fizzler instance we want to replace.
         sign_item = connections.ITEMS[inst['targetname']]
@@ -185,7 +187,7 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
 
         sign_item.delete_antlines()
 
-        if fizzler is None:
+        if fizzler is None or fizzler_item is None:
             # No fizzler - remove this sign
             inst.remove()
             return
@@ -262,25 +264,25 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
             sign_floor_loc = sign_loc.copy()
             sign_floor_loc.z = 0  # We don't care about z-positions.
 
-            s, l = Vec.bbox(itertools.chain.from_iterable(fizzler.emitters))
+            pos1, pos2 = Vec.bbox(itertools.chain.from_iterable(fizzler.emitters))
 
             if fizz_norm_axis == 'z':
                 # For z-axis, just compare to the center point of the emitters.
-                sign_dir = ((s.x + l.x) / 2, (s.y + l.y) / 2, 0) - sign_floor_loc
+                sign_dir = ((pos1.x + pos2.x) / 2, (pos1.y + pos2.y) / 2, 0) - sign_floor_loc
             else:
                 # For the other two, we compare to the line,
                 # or compare to the closest side (in line with the fizz)
 
-                if fizz_norm_axis == 'x':  #  Extends in Y direction
+                if fizz_norm_axis == 'x':  # Extends in Y direction
                     other_axis = 'y'
-                    side_min = s.y
-                    side_max = l.y
-                    normal = s.x
+                    side_min = pos1.y
+                    side_max = pos2.y
+                    normal = pos1.x
                 else:  # Extends in X direction
                     other_axis = 'x'
-                    side_min = s.x
-                    side_max = l.x
-                    normal = s.y
+                    side_min = pos1.x
+                    side_max = pos2.x
+                    normal = pos1.y
 
                 # Right in line with the fizzler. Point at the closest emitter.
                 if abs(sign_floor_loc[other_axis] - normal) < 32:
@@ -312,17 +314,17 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
             sign_yaw = int(sign_yaw - 90) % 360
 
             if inst_normal.z > 0:
-                sign_angle = '0 {} 0'.format(sign_yaw)
+                sign_angle = FrozenAngle(0, sign_yaw, 0)
             elif inst_normal.z < 0:
                 # Flip upside-down for ceilings
-                sign_angle = '0 {} 180'.format(sign_yaw)
+                sign_angle = FrozenAngle(0, sign_yaw, 180)
             else:
                 raise AssertionError('Cannot be zero here!')
         else:
             # On a wall, face upright
-            sign_angle = conditions.PETI_INST_ANGLE[inst_normal.as_tuple()]
+            sign_angle = conditions.PETI_INST_ANGLE[inst_normal.freeze()]
 
-        # If disable_other, we show off signs. Otherwise we don't use that sign.
+        # If disable_other, we show off signs. Otherwise, we don't use that sign.
         blue_sign = blue_sign_on if blue_enabled else blue_sign_off if disable_other else None
         oran_sign = oran_sign_on if oran_enabled else oran_sign_off if disable_other else None
 
@@ -407,8 +409,6 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
             Output(output, neg_trig, 'Disable'),
         ]
 
-        voice_attr = vbsp.settings['has_attr']
-
         if blue_enabled or disable_other:
             # If this is blue/oran only, don't affect the other color
             neg_trig.outputs.append(Output(
@@ -425,10 +425,7 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
             ))
             if blue_enabled:
                 # Add voice attributes - we have the gun and gel!
-                voice_attr['bluegelgun'] = True
-                voice_attr['bluegel'] = True
-                voice_attr['bouncegun'] = True
-                voice_attr['bouncegel'] = True
+                info.set_attr('bluegelgun', 'bluegel', 'bouncegun', 'bouncegel')
 
         if oran_enabled or disable_other:
             neg_trig.outputs.append(Output(
@@ -444,10 +441,7 @@ def res_make_tag_fizzler(vmf: VMF, info: conditions.MapInfo, res: Property) -> c
                 param=srctools.bool_as_int(pos_oran),
             ))
             if oran_enabled:
-                voice_attr['orangegelgun'] = True
-                voice_attr['orangegel'] = True
-                voice_attr['speedgelgun'] = True
-                voice_attr['speedgel'] = True
+                info.set_attr('orangegelgun', 'orangegel', 'speedgelgun', 'speedgel')
 
         if not oran_enabled and not blue_enabled:
             # If both are disabled, we must shutdown the gun when touching

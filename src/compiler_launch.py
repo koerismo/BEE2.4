@@ -1,7 +1,9 @@
 """Launches the correct compiler."""
+
+# ruff: noqa: E402  # Ignore import order, we want to set up logging as early as possible.
 import os
 import sys
-import trio  # Install its import hook
+
 
 if hasattr(sys, 'frozen'):
     app_name = os.path.basename(sys.executable).casefold()
@@ -14,17 +16,46 @@ else:
     # Sourcecode-launch - check first sys arg.
     app_name = sys.argv.pop(1).casefold()
 
-if app_name in ('vbsp.exe', 'vbsp_osx', 'vbsp_linux'):
+app_name = app_name.removesuffix('_osx').removesuffix('_linux').removesuffix('.exe')
+
+if 'original' in app_name:
+    sys.exit('Original compilers replaced, verify game files in Steam!')
+
+if app_name not in ('vbsp', 'vrad'):
+    sys.exit(f'Unknown application name "{app_name}"!')
+
+if app_name == 'vrad' and '--errorserver' in sys.argv:
+    app_name = 'error_server'
+
+from srctools.logger import init_logging
+LOGGER = init_logging(f'bee2/{app_name}.log')
+LOGGER.info('Arguments: {}', sys.argv)
+
+import utils
+
+LOGGER.info('Running "{}", version {}:', app_name, utils.BEE_VERSION)
+
+if app_name == 'vbsp':
     import vbsp
-    trio.run(vbsp.main)
-elif app_name in ('vrad.exe', 'vrad_osx', 'vrad_linux'):
-    if '--errorserver' in sys.argv:
-        import error_server
-        trio.run(error_server.main)
-    else:
-        import vrad
-        trio.run(vrad.main, sys.argv)
-elif 'original' in app_name:
-    sys.exit('Original compilers replaced, verify game cache!')
+    func = vbsp.main
+elif app_name == 'error_server':
+    import error_server
+    func = error_server.main
+elif app_name == 'vrad':
+    import vrad
+    func = vrad.main
 else:
-    sys.exit('Unknown application name "{}"!'.format(app_name))
+    raise AssertionError(app_name)
+
+from trio_debug import Tracer
+tracer = Tracer() if utils.CODE_DEV_MODE else None
+
+import trio
+trio.run(
+    func, sys.argv,
+    strict_exception_groups=True,  # Opt into 3.11-style semantics.
+    instruments=[tracer] if tracer is not None else [],
+)
+
+if tracer is not None:
+    tracer.display_slow()

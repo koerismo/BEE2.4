@@ -1,35 +1,32 @@
 """Implements the BEE2 VBSP compiler replacement."""
-# Do this very early, so we log the startup sequence.
-from srctools.logger import init_logging
-
-import user_errors
-
-
-LOGGER = init_logging('bee2/vbsp.log')
-
-
-from typing import Any, Dict, List, Tuple, Set, Iterable, Optional
-from typing_extensions import TypedDict
+from typing import Any, NamedTuple, TypedDict
+from collections.abc import Iterable
+from collections import defaultdict, Counter
+from operator import itemgetter
 from io import StringIO
-from collections import defaultdict, namedtuple, Counter
 import os
 import sys
 import shutil
 import logging
 import pickle
-import contextlib
 
-from srctools import AtomicWriter, Property, Vec, Vec_tuple, Angle, Matrix
-from srctools.vmf import VMF, Entity, Output
+
+from aioresult import ResultCapture
+from srctools import AtomicWriter, Keyvalues, Vec, FrozenVec, Angle
+from srctools.dmx import Element
 from srctools.game import Game
+from srctools.vmf import VMF, Entity, Output
+import async_util
+import attrs
 import srctools
-import srctools.run
 import srctools.logger
+import srctools.run
 import trio
 
 from BEE2_config import ConfigFile
 import utils
 from precomp.collisions import Collisions
+from quote_pack import QuoteInfo
 from precomp import (
     instance_traits,
     brushLoc,
@@ -39,6 +36,7 @@ from precomp import (
     template_brush,
     texturing,
     tiling,
+    tiling_gen,
     barriers,
     connections,
     options,
@@ -53,30 +51,32 @@ from precomp import (
     cubes,
     errors,
 )
+import config
 import consts
 import editoritems
+import user_errors
+
+
+LOGGER = srctools.logger.get_logger()
 
 
 class _Settings(TypedDict):
     """Configuration data extracted from VBSP_config. TODO: Eliminate and make local vars."""
-    textures: Dict[str, Any]
-    options: Dict[str, Any]
-    fog: Dict[str, Any]
-    elevator: Dict[str, str]
-    music_conf: Optional[Property]
+    textures: dict[str, Any]
+    fog: dict[str, Any]
+    elevator: dict[str, str]
+    music_conf: Keyvalues
 
-    style_vars: Dict[str, bool]
-    has_attr: Dict[str, bool]
+    style_vars: dict[str, bool]
+
 
 settings: _Settings = {
     "textures":       {},
-    "options":        {},
     "fog":            {},
     "elevator":       {},
-    'music_conf':     None,
+    'music_conf':     Keyvalues('', []),
 
     "style_vars":     defaultdict(bool),
-    "has_attr":       defaultdict(bool),
 }
 
 COND_MOD_NAME = 'VBSP'
@@ -84,41 +84,45 @@ BEE2_config = ConfigFile('compile.cfg')
 
 # These are overlays which have been modified by
 # conditions, and shouldn't be restyled or modified later.
-IGNORED_OVERLAYS: Set[Entity] = set()
-
-PRESET_CLUMPS = []  # Additional clumps set by conditions, for certain areas.
+IGNORED_OVERLAYS: set[Entity] = set()
 
 
-async def load_settings() -> Tuple[
-    antlines.AntType, antlines.AntType,
-    Dict[str, editoritems.Item],
+async def load_settings() -> tuple[
+    antlines.IndicatorStyle,
+    dict[utils.ObjectID, editoritems.Item],
     corridor.ExportedConf,
 ]:
     """Load in all our settings from vbsp_config."""
     # Do all our file parsing concurrently.
-    try:
-        with contextlib.ExitStack() as file_stack:
-            file_config = file_stack.enter_context(open("bee2/vbsp_config.cfg", encoding='utf8'))
-            file_editor = file_stack.enter_context(open('bee2/editor.bin', 'rb'))
-            file_corridor = file_stack.enter_context(open('bee2/corridors.bin', 'rb'))
-            file_packlist = file_stack.enter_context(open('bee2/pack_list.cfg'))
+    def load_pickle(filename: str) -> object:
+        """Open then load a pickle file. Typed as object to force manual checks below."""
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
 
-            async with trio.open_nursery() as nursery:
-                res_conf = utils.Result.sync(nursery, Property.parse, file_config)
-                res_editor: utils.Result[
-                    Iterable[editoritems.Item]
-                ] = utils.Result.sync(nursery, pickle.load, file_editor)
-                res_corr: utils.Result[corridor.ExportedConf] = utils.Result.sync(
-                    nursery,
-                    pickle.load, file_corridor,
-                )
-                res_packlist = utils.Result.sync(
-                    nursery,
-                    Property.parse, file_packlist, 'bee2/pack_list.cfg',
-                )
-                # Load in templates locations.
-                nursery.start_soon(template_brush.load_templates, 'bee2/templates.lst')
-    except FileNotFoundError:
+    def load_keyvalues(filename: str) -> Keyvalues:
+        """Open then load a keyvalues1 file."""
+        with open(filename, encoding='utf8') as f:
+            return Keyvalues.parse(f, filename)
+
+    def load_dmx_config(filename: str) -> config.Config:
+        """Load our main DMX config."""
+        with open(filename, 'rb') as f:
+            dmx, fmt_name, fmt_ver = Element.parse(f)
+        conf, upgrade, extra = config.COMPILER.parse_dmx(dmx, fmt_name, fmt_ver)
+        # We're never changing the file, no point upgrading it. The app will do so next
+        # export anyway. The parse function has already logged, so we can ignore those.
+        return conf
+
+    try:
+        async with trio.open_nursery() as nursery:
+            res_vconf = async_util.sync_result(nursery, load_keyvalues, "bee2/vbsp_config.cfg")
+            res_packlist = async_util.sync_result(nursery, load_keyvalues, 'bee2/pack_list.cfg')
+            res_editor = async_util.sync_result(nursery, load_pickle, 'bee2/editor.bin')
+            res_corr = async_util.sync_result(nursery, load_pickle, 'bee2/corridors.bin')
+            res_dmx_conf = async_util.sync_result(nursery, load_dmx_config, 'bee2/config.dmx')
+            # Load in templates locations.
+            nursery.start_soon(template_brush.load_templates, 'bee2/templates.lst')
+    except* OSError:
         LOGGER.exception(
             'Failed to parse required config file. Recompile the compiler '
             'and/or export the palette.'
@@ -127,70 +131,71 @@ async def load_settings() -> Tuple[
         )
         sys.exit(1)
 
-    conf = res_conf()
+    vconf = res_vconf.result()
+    tex_block = Keyvalues('Textures', list(vconf.find_children('textures')))
 
-    texturing.load_config(conf.find_block('textures', or_blank=True))
-
-    # Antline texturing settings.
-    # We optionally allow different ones for floors.
-    ant_wall = ant_floor = None
-    for prop in conf.find_all('Textures', 'Antlines'):
-        if 'floor' in prop:
-            ant_floor = antlines.AntType.parse(prop.find_key('floor'))
-        if 'wall' in prop:
-            ant_wall = antlines.AntType.parse(prop.find_key('wall'))
-        # If both are not there, allow omitting the subkey.
-        if ant_wall is ant_floor is None:
-            ant_wall = ant_floor = antlines.AntType.parse(prop)
-    if ant_wall is None:
-        ant_wall = antlines.AntType.default()
-    if ant_floor is None:
-        ant_floor = ant_wall
+    texturing.load_config(tex_block)
 
     # Load in our main configs...
-    options.load(conf.find_all('Options'))
-    utils.DEV_MODE = options.get(bool, 'dev_mode')
-
-    # The voice line property block
-    for quote_block in conf.find_all("quotes"):
-        voice_line.QUOTE_DATA.extend(quote_block)
+    options.load(vconf.find_all('Options'))
+    config.COMPILER.merge_conf(res_dmx_conf.result())
+    utils.DEV_MODE = options.DEV_MODE()
 
     # Configuration properties for styles.
-    for stylevar_block in conf.find_all('stylevars'):
+    for stylevar_block in vconf.find_all('stylevars'):
         for var in stylevar_block:
             settings['style_vars'][var.name.casefold()] = srctools.conv_bool(var.value)
 
-    # Load a copy of the item configuration.
-    id_to_item: dict[str, editoritems.Item] = {}
-    for item in res_editor():
-        id_to_item[item.id.casefold()] = item
+    # Load out a copy of the item configuration, checking types as we go.
+    # The pickle could have produced anything.
+    id_to_item: dict[utils.ObjectID, editoritems.Item] = {}
+
+    editor_list = res_editor.result()
+    if not isinstance(editor_list, list):
+        raise ValueError(f'Invalid list of editor items, got: {editor_list!r}')
+    for item in editor_list:
+        if isinstance(item, editoritems.Item):
+            id_to_item[item.id] = item
+        else:
+            raise ValueError(f'Invalid editor item, got: {item!r}')
 
     # Send that data to the relevant modules.
     instanceLocs.load_conf(id_to_item.values())
     connections.read_configs(id_to_item.values())
 
+    # Antline texturing settings.
+    indicators = antlines.IndicatorStyle.parse(
+        # Collect all blocks, since they may be in separate blocks for antlines/checkmarks/timers.
+        Keyvalues('Antlines', list(tex_block.find_children('antlines'))),
+        'the main antline configuration',
+        antlines.IndicatorStyle.from_legacy(id_to_item),
+    )
+    if indicators.toggle_var:
+        LOGGER.warning('A custom toggle var is nonsensical on the default antline definition. Removing.')
+        indicators = attrs.evolve(indicators, toggle_var='')
+
     # Parse packlist data.
-    packing.parse_packlists(res_packlist())
+    packing.parse_packlists(res_packlist.result())
 
     # Parse all the conditions.
-    for cond in conf.find_all('conditions', 'condition'):
+    for cond in vconf.find_all('conditions', 'condition'):
         conditions.add(cond)
 
-    # Data for different cube types.
-    cubes.parse_conf(conf)
-
-    # Fizzler data
-    fizzler.read_configs(conf)
+    cubes.parse_conf(vconf)
+    fizzler.read_configs(vconf)
+    barriers.parse_conf(vconf)
 
     # Selected corridors.
-    corridor_conf = res_corr()
+    corridor_conf = res_corr.result()
+    if not isinstance(corridor_conf, corridor.ExportedConf):
+        raise ValueError(f'Invalid corridor config, got {corridor_conf!r}')
 
     # Signage items
     from precomp.conditions.signage import load_signs
-    load_signs(conf)
+    load_signs(vconf)
 
     # Get configuration for the elevator, defaulting to ''.
-    elev = conf.find_block('elevator', or_blank=True)
+    elev = vconf.find_block('elevator', or_blank=True)
     settings['elevator'] = {
         key: elev[key, '']
         for key in
@@ -200,13 +205,13 @@ async def load_settings() -> Tuple[
         )
     }
 
-    settings['music_conf'] = conf.find_block('MusicScript', or_blank=True)
+    settings['music_conf'] = vconf.find_block('MusicScript', or_blank=True)
 
     # Bottomless pit configuration
-    bottomlessPit.load_settings(conf.find_block("bottomless_pit", or_blank=True))
+    bottomlessPit.load_settings(vconf.find_block("bottomless_pit", or_blank=True))
 
     # Fog settings - from the skybox (env_fog_controller, env_tonemap_controller)
-    fog_config = conf.find_block("fog", or_blank=True)
+    fog_config = vconf.find_block("fog", or_blank=True)
     # Update inplace so imports get the settings
     settings['fog'].update({
         # These defaults are from Clean Style.
@@ -216,7 +221,7 @@ async def load_settings() -> Tuple[
         'primary': fog_config['primaryColor', '40 53 64'],
         'secondary': fog_config['secondaryColor', ''],
         'direction': fog_config['direction', '0 0 0'],
-        # These appear to be always the same..
+        # These appear to be always the same.
         'height_start': fog_config['height_start', '0'],
         'height_density': fog_config['height_density', '0'],
         'height_max_density': fog_config['height_max_density', '1'],
@@ -232,28 +237,29 @@ async def load_settings() -> Tuple[
     })
 
     LOGGER.info("Settings Loaded!")
-    return ant_floor, ant_wall, id_to_item, corridor_conf
+    return indicators, id_to_item, corridor_conf
 
 
-async def load_map(map_path: str) -> VMF:
+def load_map(map_path: str) -> VMF:
     """Load in the VMF file."""
-    with open(map_path) as file:
+    with open(map_path, encoding='utf8') as file:
         LOGGER.info("Parsing Map...")
-        props = await trio.to_thread.run_sync(Property.parse, file, map_path)
+        kv = Keyvalues.parse(file, map_path)
     LOGGER.info('Reading Map...')
-    vmf = await trio.to_thread.run_sync(VMF.parse, props)
+    vmf = VMF.parse(kv)
     LOGGER.info("Loading complete!")
     return vmf
 
 
-@conditions.meta_cond(priority=100)
-def add_voice(vmf: VMF, coll: Collisions, info: corridor.Info) -> None:
+@conditions.MetaCond.VoiceLine.register
+def add_voice(vmf: VMF, coll: Collisions, info: corridor.Info, voice: QuoteInfo) -> None:
     """Add voice lines to the map."""
     voice_line.add_voice(
         style_vars=settings['style_vars'],
         coll=coll,
         vmf=vmf,
         info=info,
+        voice=voice,
         use_priority=BEE2_config.get_bool('General', 'voiceline_priority', False),
     )
 
@@ -262,7 +268,7 @@ FIZZ_BUMPER_WIDTH = 32  # The width of bumper brushes
 FIZZ_NOPORTAL_WIDTH = 16  # Width of noportal_volumes
 
 
-@conditions.meta_cond(priority=200, only_once=True)
+@conditions.MetaCond.AntiFizzBump.register
 def anti_fizz_bump(vmf: VMF) -> None:
     """Create portal_bumpers and noportal_volumes surrounding fizzlers.
 
@@ -289,7 +295,7 @@ def anti_fizz_bump(vmf: VMF) -> None:
         fizz_name = cleanser['targetname']
         if fizz_name.endswith('_brush'):
             # Fizzlers will be changed to this in fix_func_brush()
-            fizz_name = fizz_name[:-6] + '-br_brush'
+            fizz_name = fizz_name.removesuffix('_brush') + '-br_brush'
 
         # Only have 1 bumper per brush
         if fizz_name not in bumpers:
@@ -346,15 +352,8 @@ def anti_fizz_bump(vmf: VMF) -> None:
 
     LOGGER.info('Done!')
 
-# The paths for player models and the portalgun skin
-PLAYER_MODELS = {
-    'sp': ('player/chell/player', 0),
-    'atlas': ('player/ballbot/ballbot', 1),
-    'pbody': ('player/eggbot/eggbot', 2),
-}
 
-
-@conditions.meta_cond(priority=400, only_once=True)
+@conditions.MetaCond.PlayerModel.register
 def set_player_model(vmf: VMF, info: corridor.Info) -> None:
     """Set the player model in SinglePlayer."""
 
@@ -364,21 +363,33 @@ def set_player_model(vmf: VMF, info: corridor.Info) -> None:
     if info.is_coop:  # Not in coop..
         return
 
-    loc = options.get(Vec, 'global_ents_loc')
+    loc = options.GLOBAL_ENTS_LOC()
     assert loc is not None
-    chosen_model = BEE2_config.get_val('General', 'player_model', 'PETI').casefold()
+    model_id = BEE2_config.get_val(
+        'General', 'player_model_id',
+        consts.DEFAULT_PLAYER,
+    )
+    try:
+        chosen_model = utils.obj_id(model_id)
+    except ValueError:
+        LOGGER.warning('Invalid player model ID "{}"!', model_id)
+        return
 
-    if chosen_model == 'peti':
+    if chosen_model == consts.DEFAULT_PLAYER:
         # The default model..
         return
 
-    model_path, pgun_skin = PLAYER_MODELS[chosen_model]
+    try:
+        player = config.COMPILER.get_cur_conf(config.player.ExportPlayer, chosen_model, LookupError)
+    except LookupError:
+        LOGGER.warning('Unknown player model ID "{}"!', chosen_model)
+        return
 
     # Precache the model, so we can switch to it.
     vmf.create_ent(
         classname='comp_precache_model',
         origin=loc,
-        model='models/' + model_path + '.mdl',
+        model=f'models/{player.model}.mdl',
     )
 
     auto = vmf.create_ent(
@@ -393,7 +404,7 @@ def set_player_model(vmf: VMF, info: corridor.Info) -> None:
         'OnMapSpawn',
         '@command',
         'Command',
-        'setmodel ' + model_path,
+        f'setmodel {player.model}',
         delay=0.1,
     ))
 
@@ -402,18 +413,18 @@ def set_player_model(vmf: VMF, info: corridor.Info) -> None:
         'OnLoadGame',
         '@command',
         'Command',
-        'setmodel ' + model_path,
+        f'setmodel {player.model}',
         delay=0.1,
     ))
 
-    if pgun_skin and options.get(str, 'game_id') == utils.STEAM_IDS['PORTAL2']:
+    if player.pgun_skin and options.GAME_ID() == utils.STEAM_IDS['PORTAL2']:
         # Only change portalgun skins in Portal 2 - this is the vanilla
         # portalgun weapon/viewmodel.
         auto.add_out(Output(
             'OnMapSpawn',
             'viewmodel',  # Classname of the viewmodel.
             'Skin',
-            str(pgun_skin),
+            player.pgun_skin,
             delay=0.1,
         ))
         auto.add_out(Output(
@@ -423,12 +434,12 @@ def set_player_model(vmf: VMF, info: corridor.Info) -> None:
             # but that's fine.
             'weapon_portalgun',
             'Skin',
-            str(pgun_skin),
+            player.pgun_skin,
             delay=0,
         ))
 
 
-@conditions.meta_cond(priority=500, only_once=True)
+@conditions.MetaCond.PlayerPortalGun.register
 def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
     """Controls which portalgun the player will be given.
 
@@ -448,7 +459,7 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
       `NeedsPortalMan` still works to add this in Coop.
     """
 
-    if options.get(str, 'game_id') == utils.STEAM_IDS['TAG']:
+    if options.GAME_ID() == utils.STEAM_IDS['TAG']:
         return  # Aperture Tag doesn't have Portal Guns!
 
     LOGGER.info('Setting Portalgun:')
@@ -459,9 +470,11 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
     force_portal_man = has_btn_onoff or info.has_attr('needsportalman')
 
     LOGGER.info(
-        'Blue: {}, Orange: {!s}',
+        'Blue: {}, Orange: {}, On/Off: {}, Portal Manager: {}',
         'Y' if blue_portal else 'N',
         'Y' if oran_portal else 'N',
+        'Y' if has_btn_onoff else 'N',
+        'Y' if force_portal_man else 'N',
     )
 
     if blue_portal and oran_portal:
@@ -471,7 +484,7 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
     else:
         info.set_attr('spawn_nogun')
 
-    ent_pos = options.get(Vec, 'global_pti_ents_loc')
+    ent_pos = options.GLOBAL_PTI_ENTS_LOC()
     assert ent_pos is not None
 
     logic_auto = vmf.create_ent('logic_auto', origin=ent_pos, flags='1')
@@ -536,6 +549,7 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
 
         # Detect the group ID of portals placed in the map, and write to
         # the entities what we determine.
+        port_ids: Iterable[int]
         if info.is_coop:
             port_ids = (0, 1, 2)
         else:
@@ -543,7 +557,7 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
 
         for port_id in port_ids:
             trigger_portal = vmf.create_ent(
-                targetname='__pgun_port_detect_{}'.format(port_id),
+                targetname=f'__pgun_port_detect_{port_id}',
                 classname='func_portal_detector',
                 origin=ent_pos,
                 CheckAllIDs=0,
@@ -552,26 +566,16 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
             trigger_portal.solids = [whole_map.copy()]
             trigger_portal.add_out(
                 Output(
-                    'OnStartTouchPortal1',
-                    '!activator',
-                    'RunScriptCode',
-                    '__pgun_is_oran <- 0; '
-                    '__pgun_port_id <- {}; '
-                    '__pgun_active <- 1'.format(port_id),
+                    'OnStartTouchPortal1', '@portalgun',
+                    'CallScriptFunction', f'_on_blue{port_id}_open'
                 ),
                 Output(
-                    'OnStartTouchPortal2',
-                    '!activator',
-                    'RunScriptCode',
-                    '__pgun_is_oran <- 1; '
-                    '__pgun_port_id <- {}; '
-                    '__pgun_active <- 1'.format(port_id),
+                    'OnStartTouchPortal2', '@portalgun',
+                    'CallScriptFunction', f'_on_oran{port_id}_open',
                 ),
                 Output(
-                    'OnEndTouchPortal',
-                    '!activator',
-                    'RunScriptCode',
-                    '__pgun_active <- 0',
+                    'OnEndTouchPortal', '@portalgun',
+                    'CallScriptFunction', f'_on_close{port_id}',
                 ),
             )
 
@@ -635,7 +639,7 @@ def set_player_portalgun(vmf: VMF, info: corridor.Info) -> None:
     LOGGER.info('Done!')
 
 
-@conditions.meta_cond(priority=750, only_once=True)
+@conditions.MetaCond.Screenshot.register
 def add_screenshot_logic(vmf: VMF, info: corridor.Info) -> None:
     """If the screenshot type is 'auto', add in the needed ents."""
     if BEE2_config.get_val(
@@ -645,17 +649,17 @@ def add_screenshot_logic(vmf: VMF, info: corridor.Info) -> None:
         vmf.create_ent(
             classname='func_instance',
             file=SSHOT_FNAME,
-            origin=options.get(Vec, 'global_ents_loc'),
+            origin=options.GLOBAL_ENTS_LOC(),
             angles='0 0 0',
         )
         conditions.ALL_INST.add(SSHOT_FNAME)
         LOGGER.info('Added Screenshot Logic')
 
 
-@conditions.meta_cond(priority=100, only_once=True)
+@conditions.MetaCond.FogEnts.register
 def add_fog_ents(vmf: VMF, info: corridor.Info) -> None:
     """Add the tonemap and fog controllers, based on the skybox."""
-    pos = options.get(Vec, 'global_ents_loc')
+    pos = options.GLOBAL_ENTS_LOC()
     vmf.create_ent(
         classname='env_tonemap_controller',
         targetname='@tonemapper',
@@ -702,14 +706,14 @@ def add_fog_ents(vmf: VMF, info: corridor.Info) -> None:
         fog_controller['fogcolor2'] = fog_opt['secondary']
         fog_controller['use_angles'] = '1'
 
-    logic_auto = vmf.create_ent(classname='logic_auto', origin=pos, flags='1')
+    logic_auto = vmf.create_ent(classname='logic_auto', origin=pos, flags='0')
 
     logic_auto.add_out(
         Output(
             'OnMapSpawn',
             '@clientcommand',
             'Command',
-            'r_flashlightbrightness 1',
+            'r_flashlightbrightness 3',
         ),
 
         Output(
@@ -774,8 +778,21 @@ def add_fog_ents(vmf: VMF, info: corridor.Info) -> None:
             only_once=True,
         ))
 
+    if options.SKY_DRAW_FIRST():
+        logic_auto.add_out(Output(
+            'OnMapSpawn',
+            '@broadcastcommand',
+            'Command',
+            'r_skybox_draw_last 0',
+        ), Output(
+            'OnLoadGame',
+            '@broadcastcommand',
+            'Command',
+            'r_skybox_draw_last 0',
+        ))
 
-@conditions.meta_cond(priority=50, only_once=True)
+
+@conditions.MetaCond.ElevatorVideos.register
 def set_elev_videos(vmf: VMF, info: corridor.Info) -> None:
     """Add the scripts and options for customisable elevator videos to the map."""
     vid_type = settings['elevator']['type'].casefold()
@@ -800,10 +817,10 @@ def set_elev_videos(vmf: VMF, info: corridor.Info) -> None:
         vert_vid = None
         horiz_vid = None
     else:
-        LOGGER.warning('Invalid elevator video type!')
+        LOGGER.warning('Invalid elevator video type: {!r}', vid_type)
         return
 
-    transition_ents = instanceLocs.resolve('[transitionents]')
+    transition_ents = instanceLocs.resolve_filter('[transitionents]')
     for inst in vmf.by_class['func_instance']:
         if inst['file'].casefold() not in transition_ents:
             continue
@@ -821,7 +838,7 @@ def set_elev_videos(vmf: VMF, info: corridor.Info) -> None:
         )
 
 
-def add_goo_mist(vmf, sides: Iterable[Vec_tuple]):
+def add_goo_mist(vmf: VMF, sides: Iterable[FrozenVec]) -> None:
     """Add water_mist* particle systems to goo.
 
     This uses larger particles when needed to save ents.
@@ -868,8 +885,8 @@ def add_goo_mist(vmf, sides: Iterable[Vec_tuple]):
 
 def fit_goo_mist(
     vmf: VMF,
-    sides: Iterable[Vec_tuple],
-    needs_mist: Set[Tuple[float, float, float]],
+    sides: Iterable[FrozenVec],
+    needs_mist: set[FrozenVec],
     grid_x: int,
     grid_y: int,
     particle: str,
@@ -885,7 +902,7 @@ def fit_goo_mist(
         if pos not in needs_mist:
             continue  # We filled this space already
         for x, y in utils.iter_grid(grid_x, grid_y, stride=128):
-            if (pos.x+x, pos.y+y, pos.z) not in needs_mist:
+            if (pos + (x, y, 0.0)) not in needs_mist:
                 break  # Doesn't match
         else:
             vmf.create_ent(
@@ -893,38 +910,34 @@ def fit_goo_mist(
                 targetname='@goo_mist',
                 start_active='1',
                 effect_name=particle,
-                origin='{x!s} {y!s} {z!s}'.format(
-                    x=pos.x + (grid_x/2 - 64),
-                    y=pos.y + (grid_y/2 - 64),
-                    z=pos.z + 48,
-                ),
+                origin=pos.thaw() + (grid_x/2 - 64, grid_y/2 - 64, 48.0),
                 angles=angles,
             )
             for (x, y) in utils.iter_grid(grid_x, grid_y, stride=128):
-                needs_mist.remove((pos.x+x, pos.y+y, pos.z))
+                needs_mist.remove(pos + (x, y, 0.0))
 
 
 def change_brush(vmf: VMF) -> None:
     """Alter all world/detail brush textures to use the configured ones."""
     LOGGER.info("Editing Brushes...")
 
-    goo_scale = options.get(float, 'goo_scale')
+    goo_scale = options.GOO_SCALE()
 
     # Goo mist must be enabled by both the style and the user.
-    make_goo_mist = options.get(bool, 'goo_mist') and srctools.conv_bool(
+    make_goo_mist = options.GOO_MIST() and srctools.conv_bool(
         settings['style_vars'].get('AllowGooMist', '1')
     )
-    mist_solids = set()
+    mist_solids: set[FrozenVec] = set()
 
     make_bottomless = bottomlessPit.pits_allowed()
     LOGGER.info('Make Bottomless Pit: {}', make_bottomless)
 
-    highest_brush = 0
+    highest_brush = 0.0
 
     # Calculate the z-level with the largest number of goo brushes,
     # so we can ensure the 'fancy' pit is the largest one.
     # Valve just does it semi-randomly.
-    goo_heights = Counter()
+    goo_heights: Counter[float] = Counter()
     for pos, block in brushLoc.POS.items():
         if block.is_goo and block.is_top:
             # Block position is the center,
@@ -932,7 +945,7 @@ def change_brush(vmf: VMF) -> None:
             goo_heights[brushLoc.g2w(pos).z + 32] += 1
     # Find key with the highest value = z-level with highest brush.
     try:
-        best_goo = max(goo_heights.items(), key=lambda x: x[1])[0]
+        best_goo = max(goo_heights.items(), key=itemgetter(1))[0]
     except ValueError:
         # No goo in the map, it's fine.
         best_goo = 0
@@ -949,21 +962,19 @@ def change_brush(vmf: VMF) -> None:
             )
             if face.mat in consts.Goo:
                 if make_goo_mist:
-                    mist_solids.add(
-                        solid.get_origin().as_tuple()
-                    )
+                    mist_solids.add(solid.get_origin().freeze())
                 # Apply goo scaling
                 face.scale = goo_scale
                 # Use fancy goo on the level with the
                 # highest number of blocks.
                 # All plane z are the same.
-                face.mat = texturing.SPECIAL.get(
+                texturing.SPECIAL.get(
                     face.get_origin(), (
                         'goo' if
                         face.planes[0].z == best_goo
                         else 'goo_cheap'
                     ),
-                )
+                ).apply(face)
 
     if make_bottomless:
         LOGGER.info('Creating Bottomless Pits...')
@@ -976,15 +987,18 @@ def change_brush(vmf: VMF) -> None:
         LOGGER.info('Done!')
 
 
-Clump = namedtuple('Clump', [
-    'min_pos',
-    'max_pos',
-    'tex',
-])
+class Clump(NamedTuple):
+    """Additional clumps set by conditions. TODO: Not functional."""
+    min_pos: Vec
+    max_pos: Vec
+    tex: dict[str, str]
+
+
+PRESET_CLUMPS: list[Clump] = []
 
 
 @conditions.make_result('SetAreaTex')
-def cond_force_clump(res: Property) -> conditions.ResultCallable:
+def cond_force_clump(res: Keyvalues) -> conditions.ResultCallable:
     """Force an area to use certain textures.
 
     This only works in styles using the clumping texture algorithm.
@@ -1030,15 +1044,15 @@ def cond_force_clump(res: Property) -> conditions.ResultCallable:
     return set_tex
 
 
-@conditions.meta_cond(priority=-10)
+@conditions.MetaCond.ExitSigns.register
 def position_exit_signs(vmf: VMF) -> None:
     """Configure exit signage.
 
-    If "remove_exit_signs" is set, then delete them. Otherwise if "signExitInst"
+    If "remove_exit_signs" is set, then delete them. Otherwise, if "signExitInst"
     is set, overlay the specified instance on top of the sign pair.
     """
-    exit_sign: Optional[Entity]
-    exit_arrow: Optional[Entity]
+    exit_sign: Entity | None
+    exit_arrow: Entity | None
     try:
         [exit_sign] = vmf.by_target['exitdoor_stickman']
     except ValueError:
@@ -1048,14 +1062,17 @@ def position_exit_signs(vmf: VMF) -> None:
     except ValueError:
         exit_arrow = None
 
-    if options.get(bool, "remove_exit_signs"):
+    # If turned off, user requested removal of signs entirely.
+    enable_signs = options.get_itemconf(('VALVE_MANDATORY', 'ExitSignage'), True)
+
+    if not enable_signs or options.REMOVE_EXIT_SIGNS():
         if exit_sign is not None:
             exit_sign.remove()
         if exit_arrow is not None:
             exit_arrow.remove()
 
-    inst_filename = options.get(str, 'signExitInst')
-    if inst_filename is None or exit_sign is None or exit_arrow is None:
+    inst_filename = options.SIGN_EXIT_INST()
+    if not enable_signs or inst_filename is None or exit_sign is None or exit_arrow is None:
         return
 
     sign_pos = Vec.from_str(exit_sign['origin'])
@@ -1071,7 +1088,7 @@ def position_exit_signs(vmf: VMF) -> None:
     arrow_dir = -Vec.from_str(exit_arrow['basisv'])  # Texture points down.
     u = Vec.from_str(exit_sign['basisu'])
     v = Vec.from_str(exit_sign['basisv'])
-    angles = Matrix.from_basis(x=u, y=v, z=sign_norm).to_angle()
+    angles = Angle.from_basis(x=u, y=v, z=sign_norm)
 
     if arrow_dir == u:
         sign_dir = 'east'
@@ -1106,7 +1123,7 @@ def position_exit_signs(vmf: VMF) -> None:
     conditions.ALL_INST.add(inst_filename.casefold())
     inst.fixup['$arrow'] = sign_dir
     inst.fixup['$orient'] = orient
-    if options.get(bool, "remove_exit_signs_dual"):
+    if options.REMOVE_EXIT_SIGNS_DUAL():
         exit_sign.remove()
         exit_arrow.remove()
     else:
@@ -1119,13 +1136,13 @@ def change_overlays(vmf: VMF) -> None:
     LOGGER.info("Editing Overlays...")
 
     # A frame instance to add around all the 32x32 signs
-    sign_inst = options.get(str, 'signInst')
+    sign_inst = options.SIGN_INST()
     # Resize the signs to this size. 4 vertexes are saved relative
     # to the origin, so we must divide by 2.
-    sign_size = options.get(int, 'signSize') / 2
+    sign_size = options.SIGN_SIZE() / 2
 
     # A packlist associated with the sign_inst.
-    sign_inst_pack = options.get(str, 'signPack')
+    sign_inst_pack = options.SIGN_PACK()
 
     # Grab all the textures we're using...
     for over in vmf.by_class['info_overlay']:
@@ -1157,33 +1174,27 @@ def change_overlays(vmf: VMF) -> None:
         del over['targetname']
         del over['bee_noframe']  # Not needed anymore.
 
-        over['material'] = mat = texturing.OVERLAYS.get(over.get_origin(), sign_type)
-        if not mat:
+        texturing.OVERLAYS.get(over.get_origin(), sign_type).apply_over(over)
+        if not over['material']:
             over.remove()
         if sign_size != 16:
             # Resize the signage overlays
             # These are the 4 vertex locations
             # Each axis is set to -16, 16 or 0 by default
-            for prop in ('uv0', 'uv1', 'uv2', 'uv3'):
-                val = Vec.from_str(over[prop])
+            for key in ('uv0', 'uv1', 'uv2', 'uv3'):
+                val = Vec.from_str(over[key])
                 val /= 16
                 val *= sign_size
-                over[prop] = val.join(' ')
+                over[key] = val.join(' ')
 
 
 def add_extra_ents(vmf: VMF, info: corridor.Info) -> None:
     """Add the various extra instances to the map."""
-    loc = options.get(Vec, 'global_ents_loc')
-
-    music.add(vmf, loc, settings['music_conf'], info)
-
     LOGGER.info('Adding global ents...')
 
-    # Add the global_pti_ents instance automatically, with disable_pti_audio
-    # set.
-    global_ents_pos = options.get(Vec, 'global_ents_loc')
-    pti_file = options.get(str, 'global_pti_ents')
-    pti_loc = options.get(Vec, 'global_pti_ents_loc')
+    global_ents_pos = options.GLOBAL_ENTS_LOC()
+    pti_file = options.GLOBAL_PTI_ENTS()
+    pti_loc = options.GLOBAL_PTI_ENTS_LOC()
 
     # Add a nodraw box around the global entity location, to seal it.
     vmf.add_brushes(vmf.make_hollow(
@@ -1208,6 +1219,8 @@ def add_extra_ents(vmf: VMF, info: corridor.Info) -> None:
         angles='0 0 0',
     )
 
+    music.add(vmf, global_ents_pos, settings['music_conf'], info)
+
     if info.has_attr('bridge') or info.has_attr('lightbridge'):
         # If we have light bridges, make sure we precache the particle.
         vmf.create_ent(
@@ -1218,6 +1231,7 @@ def add_extra_ents(vmf: VMF, info: corridor.Info) -> None:
         )
 
     if pti_file:
+        # Add the global_pti_ents instance automatically, with disable_pti_audio set.
         LOGGER.info('Adding Global PTI Ents')
         global_pti_ents = vmf.create_ent(
             classname='func_instance',
@@ -1232,21 +1246,13 @@ def add_extra_ents(vmf: VMF, info: corridor.Info) -> None:
         has_cave = srctools.conv_bool(
             settings['style_vars'].get('multiversecave', '1')
         )
-        global_pti_ents.fixup[
-            'disable_pti_audio'
-            ] = srctools.bool_as_int(not has_cave)
-
+        global_pti_ents.fixup['disable_pti_audio'] = not has_cave
         global_pti_ents.fixup['glados_script'] = 'choreo/glados.nut'  # Implements Multiverse Cave..
 
 
 def change_ents(vmf: VMF) -> None:
     """Edit misc entities."""
     LOGGER.info("Editing Other Entities...")
-    if options.get(bool, "remove_info_lighting"):
-        # Styles with brush-based glass edges don't need the info_lighting,
-        # delete it to save ents.
-        for ent in vmf.by_class['info_lighting']:
-            ent.remove()
     for auto in vmf.by_class['logic_auto']:
         # Remove all the logic_autos that set attachments, we can
         # replicate this in the instance
@@ -1255,28 +1261,45 @@ def change_ents(vmf: VMF) -> None:
                 vmf.remove_ent(auto)
 
 
-def fix_worldspawn(vmf: VMF) -> None:
+def write_itemid_list(vmf: VMF, used_items: Iterable[str]) -> None:
+    """To aid debugging, include info about the items in the map."""
+    # Number of keyvalues per ent to add.
+    per_ent = 16
+
+    used_item_list = sorted(used_items)
+    LOGGER.debug('Used items: \n{}', '\n'.join(used_item_list))
+    global_ents_loc = options.GLOBAL_ENTS_LOC()
+    for offset in range(0, len(used_item_list), per_ent):
+        lst_ent = vmf.create_ent(
+            'bee2_item_list',
+            origin=global_ents_loc,
+        )
+        for j, item_id in enumerate(used_item_list[offset:offset+per_ent]):
+            lst_ent[f'itemid{j:02}'] = item_id
+
+
+def fix_worldspawn(vmf: VMF, info: conditions.MapInfo) -> None:
     """Adjust some properties on WorldSpawn."""
     LOGGER.info("Editing WorldSpawn")
     if vmf.spawn['paintinmap'] != '1':
         # If PeTI thinks there should be paint, don't touch it
         # Otherwise set it based on the 'gel' voice attribute
         # If the game is Aperture Tag, it's always forced on
-        vmf.spawn['paintinmap'] = srctools.bool_as_int(
-            settings['has_attr']['gel'] or
-            options.get(str, 'game_id') == utils.STEAM_IDS['APTAG']
+        vmf.spawn['paintinmap'] = (
+            info.has_attr('gel') or
+            options.GAME_ID() == utils.STEAM_IDS['APTAG']
         )
-    vmf.spawn['skyname'] = options.get(str, 'skybox')
+    vmf.spawn['skyname'] = options.SKYBOX()
 
 
-async def find_missing_instances(game: Game, vmf: VMF) -> List[Vec]:
+async def find_missing_instances(game: Game, vmf: VMF) -> list[Vec]:
     """Go through the map, and check for missing instances.
 
     We don't raise an error immediately, because it could be possible that VBSP checks differently
     and can find them anyway. In that case just let it continue successfully.
     """
-    missing: List[Vec] = []
-    sdk_content = await trio.Path(game.path / '../sdk_content/maps/').absolute()
+    missing: list[Vec] = []
+    sdk_content = await trio.Path(game.path / '..' / 'sdk_content' / 'maps').absolute()
 
     async def check(inst: Entity) -> None:
         """See if this file exists."""
@@ -1323,11 +1346,11 @@ def save(vmf: VMF, path: str) -> None:
 
 
 def run_vbsp(
-    vbsp_args: List[str],
+    vbsp_args: list[str],
     path: str,
-    new_path: Optional[str] = None,
+    new_path: str | None = None,
     is_error_map: bool = False,
-    maybe_missing_inst: Iterable[Vec]=(),
+    maybe_missing_inst: Iterable[Vec] = (),
 ) -> None:
     """Execute the original VBSP, copying files around to make it work correctly.
 
@@ -1336,12 +1359,11 @@ def run_vbsp(
     If new_path is passed VBSP will be run on the map in styled/, and we'll
     read through the output to find the entity counts.
     """
-
     is_peti = new_path is not None
 
     # We can't overwrite the original vmf, so we run VBSP from a separate
     # location.
-    if is_peti:
+    if new_path is not None:
         # Copy the original log file
         if os.path.isfile(path.replace(".vmf", ".log")):
             shutil.copy(
@@ -1353,10 +1375,10 @@ def run_vbsp(
     vbsp_args = [x for x in vbsp_args if x and not x.isspace()]
 
     # Ensure we've fixed the instance/ folder so instances are found.
-    if utils.MAC or utils.LINUX and is_peti:
+    if (utils.MAC or utils.LINUX) and is_peti:
         instance_symlink()
 
-    # Use a special name for VBSP's output..
+    # Use a special name for VBSP's output...
     vbsp_logger = srctools.logger.get_logger('valve.VBSP', alias='<Valve>')
 
     # And also save a copy for us to analyse.
@@ -1374,7 +1396,7 @@ def run_vbsp(
         LOGGER.info('Files present: {}', os.listdir(os.path.dirname(new_path)))
         if os.path.isfile(pointfile):  # We leaked!
             points = []
-            with open(pointfile) as f:
+            with open(pointfile, encoding='ascii') as f:
                 for line in f:
                     points.append(Vec.from_str(line.strip()))
             # Preserve this, rename to match the error map we generate.
@@ -1392,7 +1414,7 @@ def run_vbsp(
     # Print output
     LOGGER.info("VBSP Done!")
 
-    if is_peti:  # Ignore Hammer maps
+    if new_path is not None:  # Ignore Hammer maps
         process_vbsp_log(buff.getvalue())
 
     # Copy over the real files so vvis/vrad can read them
@@ -1499,12 +1521,12 @@ def process_vbsp_fail(output: str, missing_locs: Iterable[Vec]) -> None:
     BEE2_config.save_check()
 
 
-async def main() -> None:
+async def main(argv: list[str]) -> None:
     """Main program code.
 
     """
-    global MAP_RAND_SEED
     LOGGER.info("BEE{} VBSP hook initiallised, srctools v{}.", utils.BEE_VERSION, srctools.__version__)
+    await trio.lowlevel.checkpoint()
 
     # Warn if srctools Cython code isn't installed.
     utils.check_cython(LOGGER.warning)
@@ -1514,21 +1536,16 @@ async def main() -> None:
     if 'BEE2_WIKI_OPT_LOC' in os.environ:
         # Special override - generate docs for the BEE2 wiki.
         LOGGER.info('Writing Wiki text...')
-        with open(os.environ['BEE2_WIKI_OPT_LOC'], 'w') as f:
-            options.dump_info(f)
-        with open(os.environ['BEE2_WIKI_COND_LOC'], 'a+') as f:
-            conditions.dump_conditions(f)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(options.dump_info, trio.Path(os.environ['BEE2_WIKI_OPT_LOC']))
+            nursery.start_soon(conditions.dump_conditions, trio.Path(os.environ['BEE2_WIKI_COND_LOC']))
         LOGGER.info('Done. Exiting now!')
         sys.exit()
 
-    # Just in case we fail, overwrite the VRAD config, so it doesn't use old data.
-    open('bee2/vrad_config.cfg', 'w').close()
-
-    args = " ".join(sys.argv)
-    new_args = sys.argv[1:]
-    old_args = sys.argv[1:]
-    folded_args = [arg.casefold() for arg in old_args]
-    path = sys.argv[-1]  # The path is the last argument to vbsp
+    args = " ".join(argv)
+    new_args = argv[1:]
+    old_args = argv[1:]
+    path = argv[-1]  # The path is the last argument to vbsp
 
     if not old_args:
         # No arguments!
@@ -1536,7 +1553,7 @@ async def main() -> None:
             'No arguments!\n'
             "The BEE2 VBSP takes all the regular VBSP's "
             'arguments, with some extra arguments:\n'
-            '-dump_conditions: Print a list of all condition flags,\n'
+            '-dump_conditions: Print a list of all condition tests,\n'
             '  results, and metaconditions.\n'
             '-bee2_verbose: Print debug messages to the console.\n'
             '-verbose: A default VBSP command, has the same effect as above.\n'
@@ -1575,8 +1592,8 @@ async def main() -> None:
         elif a == '-game':
             game_dir = new_args[i+1]
 
-    LOGGER.info('Map path is "' + path + '"')
-    LOGGER.info('New path: "' + new_path + '"')
+    LOGGER.info('Map path is "{}"', path)
+    LOGGER.info('New path: "{}"', new_path)
     if not path:
         raise Exception("No map passed!")
     if not game_dir:
@@ -1595,10 +1612,9 @@ async def main() -> None:
         # limit to determine if we should convert
         is_hammer = "-entity_limit 1750" not in args
 
-    game = Game(game_dir)
-
     if is_hammer:
         LOGGER.warning("Hammer map detected! skipping conversion..")
+        await trio.lowlevel.checkpoint()
         run_vbsp(
             vbsp_args=old_args,
             path=path,
@@ -1606,47 +1622,50 @@ async def main() -> None:
         return
 
     is_publishing = False
+    vmf: VMF | None = None
     try:
         LOGGER.info("PeTI map detected!")
 
         LOGGER.info("Loading settings...")
         async with trio.open_nursery() as nursery:
-            res_settings = utils.Result(nursery, load_settings)
-            vmf_res = utils.Result(nursery, load_map, path)
+            res_game = async_util.sync_result(nursery, Game, game_dir)
+            res_settings = ResultCapture.start_soon(nursery, load_settings)
+            vmf_res = async_util.sync_result(nursery, load_map, path)
+            voice_data_res = ResultCapture.start_soon(nursery, voice_line.load)
 
-        ant_floor, ant_wall, id_to_item, corridor_conf = res_settings()
-        vmf: VMF = vmf_res()
+        ind_style, id_to_item, corridor_conf = res_settings.result()
+        vmf = vmf_res.result()
 
         coll = Collisions()
 
-        instance_traits.set_traits(vmf, id_to_item, coll)
+        used_inst = instance_traits.set_traits(vmf, id_to_item, coll)
         # Must be before corridors!
-        brushLoc.POS.read_from_map(vmf, settings['has_attr'], id_to_item)
+        initial_voice_attrs = brushLoc.POS.read_from_map(vmf, id_to_item)
 
         rand.init_seed(vmf)
 
         info = corridor.analyse_and_modify(
             vmf, corridor_conf,
             elev_override=BEE2_config.get_bool('General', 'spawn_elev'),
-            voice_attrs=settings['has_attr'],
         )
         is_publishing = info.is_publishing
+        info.set_attr(*initial_voice_attrs)
 
         ant, side_to_antline = antlines.parse_antlines(vmf)
 
+        write_itemid_list(vmf, used_inst)
+
         # Requires instance traits!
         connections.calc_connections(
-            vmf,
-            ant,
-            texturing.OVERLAYS.get_all('shapeframe'),
-            settings['style_vars']['enableshapesignageframe'],
-            antline_wall=ant_wall,
-            antline_floor=ant_floor,
+            vmf, ant,
+            shape_frame_mat=texturing.OVERLAYS.get_all('shapeframe', False),
+            enable_shape_frame=settings['style_vars']['enableshapesignageframe'],
+            ind_style=ind_style,
         )
         change_ents(vmf)
 
         fizzler.parse_map(vmf, info)
-        barriers.parse_map(vmf, info)
+        barriers.parse_map(vmf, connections.ITEMS)
         # We have barriers, pass to our error display.
         errors.load_barriers(barriers.BARRIERS)
 
@@ -1657,18 +1676,27 @@ async def main() -> None:
         # We have tiles, pass to our error display.
         errors.load_tiledefs(tiling.TILES.values(), brushLoc.POS)
 
-        await texturing.setup(game, vmf, list(tiling.TILES.values()))
+        await texturing.setup(res_game.result(), vmf, list(tiling.TILES.values()))
 
-        conditions.check_all(vmf, coll, info)
+        conditions.check_all(vmf, coll, info, voice_data_res.result())
         add_extra_ents(vmf, info)
 
-        tiling.generate_brushes(vmf)
-        faithplate.gen_faithplates(vmf)
+        LOGGER.info('Generating tiles...')
+        if texturing.NEW_TILE_GEN:
+            tiling_gen.generate_brushes(vmf)
+        else:
+            tiling.generate_brushes(vmf)
+        LOGGER.info('Generating goop...')
+        tiling.generate_goo(vmf)
+        tiling.bind_overlays()
+
+        faithplate.gen_faithplates(vmf, info.has_attr('superposition'))
         change_overlays(vmf)
-        fix_worldspawn(vmf)
+        fix_worldspawn(vmf, info)
 
         if utils.DEV_MODE:
-            coll.dump(vmf, vis_name='collisions')
+            coll.export_debug(vmf, vis_name='collisions')
+        coll.export_vscript(vmf)
 
         # Ensure all VMF outputs use the correct separator.
         for ent in vmf.entities:
@@ -1681,13 +1709,13 @@ async def main() -> None:
         vmf.spawn['BEE2_is_peti'] = True
 
         # Save and run VBSP. If this leaks, this will raise UserError, and we'll compile again.
+        save(vmf, new_path)
         if not skip_vbsp:
-            save(vmf, new_path)
             run_vbsp(
                 vbsp_args=new_args,
                 path=path,
                 new_path=new_path,
-                maybe_missing_inst=await find_missing_instances(game, vmf),
+                maybe_missing_inst=await find_missing_instances(res_game.result(), vmf),
             )
     except errors.UserError as error:
         # The user did something wrong, so the map is invalid.
@@ -1696,11 +1724,17 @@ async def main() -> None:
             raise
         LOGGER.error('"User" error detected, aborting compile: ', exc_info=True)
 
+        error.info = attrs.evolve(error.info, vmf_fname_orig=path)
+
         # Try to preserve the current map.
-        try:
-            save(vmf, new_path[:-4] + '.error.vmf')  # noqa
-        except Exception:
-            pass
+        if vmf is not None:
+            error_fname = new_path[:-4] + '.error.vmf'
+            try:
+                save(vmf, error_fname)  # noqa
+            except Exception:
+                pass
+            else:
+                error.info = attrs.evolve(error.info, vmf_fname_new=error_fname)
 
         vmf = errors.make_map(error)
 
@@ -1719,7 +1753,3 @@ async def main() -> None:
             )
 
     LOGGER.info("BEE2 VBSP hook finished!")
-
-
-if __name__ == '__main__':
-    trio.run(main)

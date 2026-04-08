@@ -2,35 +2,42 @@
 from __future__ import annotations
 from collections import defaultdict
 
-from srctools import Property, Entity, VMF, Vec, Output, Matrix
+from srctools import VMF, Entity, Keyvalues, Matrix, Output, Vec
 import srctools.logger
 
-from precomp import connections, conditions
+import utils
+from precomp import conditions, connections
+from precomp.lazy_value import LazyValue
+from transtoken import TransToken
 import user_errors
 
 
-COND_MOD_NAME = None
+COND_MOD_NAME: str | None = None
 LOGGER = srctools.logger.get_logger(__name__, alias='cond.sendtor')
 
-# Laser name -> offset, normal
+# Laser instance -> offset, normal
 SENDTOR_TARGETS: dict[str, tuple[Vec, Vec]] = {}
-# Laser name -> relays created.
+# Laser instance -> relays created.
 SENDTOR_RELAYS: dict[str, list[Entity]] = defaultdict(list)
 
+TOK_SENDTOR_BAD_OUTPUT = TransToken.parse(utils.obj_id('HMW_SENDIFICATOR'), 'BAD_OUTPUT_ITEM')
 
-@conditions.make_result('SendificatorLaser')
-def res_sendificator_laser(res: Property):
+
+# Doesn't actually require connections, but it needs to be before Sendificator.
+@conditions.make_result('SendificatorLaser', valid_before=conditions.MetaCond.Connections)
+def res_sendificator_laser(res: Keyvalues) -> conditions.ResultCallable:
     """Record the position of the target for Sendificator Lasers."""
-    target = res.vec('offset'), res.vec('direction', 0, 0, 1)
+    offset = LazyValue.parse(res['offset', '']).as_vec()
+    normal = LazyValue.parse(res['direction', '']).as_vec(0, 0, 1)
 
     def set_laser(inst: Entity) -> None:
         """Store off the target position."""
-        SENDTOR_TARGETS[inst['targetname']] = target
+        SENDTOR_TARGETS[inst['targetname']] = offset(inst), normal(inst)
     return set_laser
 
 
-@conditions.make_result('Sendificator')
-def res_sendificator(vmf: VMF, inst: Entity):
+@conditions.make_result('Sendificator', valid_before=conditions.MetaCond.Connections)
+def res_sendificator(vmf: VMF, inst: Entity) -> None:
     """Implement Sendificators."""
     # For our version, we know which Sendificator connects to what laser,
     # so we can couple the logic together (avoiding `@sendtor_mutex`).
@@ -45,17 +52,21 @@ def res_sendificator(vmf: VMF, inst: Entity):
         delay=0.01,
     ), )
 
-    for ind, conn in enumerate(list(sendtor.outputs), start=1):
+    outputs = list(sendtor.walk_nonlogic_outputs(ignore_antlaser=True))
+    for ind, (logic, conn) in enumerate(outputs, start=1):
         las_item = conn.to_item
+        for gate in logic:
+            if gate.is_logic:
+                connections.collapse_item(gate)
         conn.remove()
         try:
             targ_offset, targ_normal = SENDTOR_TARGETS[las_item.name]
         except KeyError:
             raise user_errors.UserError(
-                user_errors.TOK_SENDTOR_BAD_OUTPUT.format(out_item=las_item.name),
+                TOK_SENDTOR_BAD_OUTPUT.format(out_item=las_item.name),
                 voxels=[Vec.from_str(sendtor.inst['origin'])],
                 points=[Vec.from_str(las_item.inst['origin'])],
-            )
+            ) from None
 
         orient = Matrix.from_angstr(las_item.inst['angles'])
 

@@ -3,36 +3,38 @@
 This includes Unstationary Scaffolds and Vactubes.
 """
 from __future__ import annotations
-from typing import Optional, Iterator, TypeVar, Generic, Iterable
+
+from collections.abc import Iterable, Iterator
+import itertools
 
 from srctools import Entity, Matrix, Vec
 import attrs
 
 from precomp import connections
 from precomp.connections import Item
+import user_errors
 
 __all__ = ['Node', 'chain']
-ConfT = TypeVar('ConfT')
 
 
 @attrs.define(eq=False)
-class Node(Generic[ConfT]):
+class Node[ConfT]:
     """Represents a single node in the chain."""
     item: Item = attrs.field(init=True)
     conf: ConfT = attrs.field(init=True)
 
     # Origin and angles of the instance.
-    pos = attrs.field(init=False, default=attrs.Factory(
+    pos: Vec = attrs.field(init=False, default=attrs.Factory(
         lambda self: Vec.from_str(self.item.inst['origin']), takes_self=True,
     ))
-    orient = attrs.field(init=False, default=attrs.Factory(
+    orient: Matrix = attrs.field(init=False, default=attrs.Factory(
         lambda self: Matrix.from_angstr(self.item.inst['angles']),
         takes_self=True,
     ))
 
     # The links between nodes
-    prev: Optional[Node[ConfT]] = attrs.field(default=None, init=False)
-    next: Optional[Node[ConfT]] = attrs.field(default=None, init=False)
+    prev: Node[ConfT] | None = attrs.field(default=None, init=False)
+    next: Node[ConfT] | None = attrs.field(default=None, init=False)
 
     @property
     def inst(self) -> Entity:
@@ -46,10 +48,10 @@ class Node(Generic[ConfT]):
         try:
             return Node(connections.ITEMS[name], conf)
         except KeyError:
-            raise ValueError('No item for "{}"?'.format(name)) from None
+            raise ValueError(f'No item for "{name}"?') from None
 
 
-def chain(
+def chain[ConfT](
     node_list: Iterable[Node[ConfT]],
     allow_loop: bool,
 ) -> Iterator[list[Node[ConfT]]]:
@@ -73,43 +75,79 @@ def chain(
                 # Not one of our instances - fine, it's just actual IO.
                 continue
             conn.remove()
-            # TODO: Render the node points.
             if node.next is not None:
-                raise ValueError(f'Item "{node.item.name}" links to multiple output items!')
+                raise user_errors.UserError(
+                    user_errors.TOK_CHAINING_MULTI_OUTPUT,
+                    points=[
+                        node.pos,
+                        node.next.pos,
+                        next_node.pos,
+                    ],
+                    lines=[
+                        (node.pos, node.next.pos),
+                        (node.pos, next_node.pos),
+                    ],
+                )
             if next_node.prev is not None:
-                raise ValueError(f'Item "{next_node.item.name}" links to multiple input items!')
+                raise user_errors.UserError(
+                    user_errors.TOK_CHAINING_MULTI_INPUT,
+                    points=[
+                        node.pos,
+                        next_node.prev.pos,
+                        next_node.pos,
+                    ],
+                    lines=[
+                        (node.pos, next_node.pos),
+                        (next_node.prev.pos, next_node.pos),
+                    ],
+                )
             node.next = next_node
             next_node.prev = node
 
     todo = set(nodes.values())
     while todo:
         # Grab a random node, then go backwards until we find the start.
-        # If we return back to this node, it's an infinite loop.
+        # If we return back to this node, it's an infinite loop. In that case
+        # we just pick an arbitrary node to be the "start" of the list.
         pop_node = todo.pop()
 
+        # First gather in this backwards order in case we do have a loop to error about.
+        node_out: list[Node[ConfT]] = []
         if pop_node.prev is None:
             start_node = pop_node
         else:
             start_node = pop_node.prev
             while True:
+                node_out.append(start_node)
                 if start_node.prev is None:
                     break
                 # We've looped back.
                 elif start_node is pop_node:
                     if not allow_loop:
-                        raise ValueError('Loop in linked items!')
+                        raise user_errors.UserError(
+                            user_errors.TOK_CHAINING_LOOP,
+                            points=[node.pos for node in node_out],
+                            lines=[
+                                (a.pos, b.pos) for a, b in
+                                # Add the first to the end so that we get a full loop of pairs.
+                                itertools.pairwise(itertools.chain(
+                                    node_out, [node_out[0]],
+                                ))
+                            ]
+                        )
                     break
                 start_node = start_node.prev
 
-        node_list = []
+        # Now we have the start, go forwards through the chain to collect them in the right order.
+        node_out.clear()
         node = start_node
         while True:
-            node_list.append(node)
+            node_out.append(node)
             todo.discard(node)
             if node.next is None:
                 break
             node = node.next
-            if node is start_node:
+            if node is start_node:  # We're looping, stop here.
                 break
 
-        yield node_list
+        yield node_out

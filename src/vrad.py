@@ -3,37 +3,44 @@
 This allows us to change the arguments passed in,
 edit the BSP after instances are collapsed, and pack files.
 """
-# Run as early as possible to catch errors in imports.
-from srctools.logger import init_logging
-LOGGER = init_logging('bee2/vrad.log')
-
-import os
-import sys
 from io import BytesIO
 from zipfile import ZipFile
-from typing import List
 from pathlib import Path
+import os
+import sys
 
-
-import srctools.run
-from srctools import FGD
+from srctools import Vec
 from srctools.bsp import BSP, BSP_LUMPS
+from srctools.const import SurfFlags
 from srctools.filesys import RawFileSystem, ZipFileSystem, FileSystem
 from srctools.packlist import PackList
 from srctools.game import find_gameinfo
+from srctools.logger import get_logger
+import srctools.run
+import trio
 
 from hammeraddons.bsp_transform import run_transformations
 from hammeraddons.plugin import PluginFinder, Source as PluginSource
-from hammeraddons import __version__ as version_haddons
-
-import trio
 
 from BEE2_config import ConfigFile
 from postcomp import music, screenshot
-# Load our BSP transforms.
-# noinspection PyUnresolvedReferences
-from postcomp import coop_responses, filter, user_error
 import utils
+
+
+LOGGER = get_logger()
+
+TEX_INVISIBLE_TOOLS = 'tools/toolsinvisible'
+TEX_INVISIBLE_PATCHED = 'bee2/invisible_noportal'
+
+
+def swap_material(bsp: BSP, src: str, dest: str) -> None:
+    """Swap material in the BSP, skipping if not present."""
+    for info in bsp.texinfo:
+        if info.mat.casefold() == src:
+            LOGGER.info('Swapping to {} for {}', dest, info)
+            # These are tools mats, details don't matter.
+            info.set(bsp, dest, Vec(0.5, 0.5, 0.5), 1, 1)
+            info.flags |= SurfFlags.NOPORTAL
 
 
 def load_transforms() -> None:
@@ -44,9 +51,8 @@ def load_transforms() -> None:
     """
     if utils.FROZEN:
         # We embedded a copy of all the transforms in this package, which auto-imports the others.
-        # noinspection PyUnresolvedReferences
-        from postcomp import transforms  # type: ignore
-        LOGGER.debug('Loading transforms from frozen package: {}', transforms)
+        from postcomp import _ha_transforms  # noqa
+        LOGGER.debug('Loading transforms from frozen package: {}', _ha_transforms)
     else:
         # We can just delegate to the regular postcompiler finder.
         transform_loc = utils.install_path('hammeraddons/transforms/').resolve()
@@ -62,8 +68,11 @@ def load_transforms() -> None:
         LOGGER.debug('Loading transforms from source: {}', transform_loc)
         finder.load_all()
 
+    # Load our additional BSP transforms.
+    from postcomp import coop_responses, filter, user_error, debug_info, collisions_export  # noqa: F401
 
-def run_vrad(args: List[str]) -> None:
+
+def run_vrad(args: list[str]) -> None:
     """Execute the original VRAD."""
     code = srctools.run.run_compiler(
         os.path.join(os.getcwd(), 'linux32/vrad' if utils.LINUX else 'vrad'),
@@ -76,11 +85,11 @@ def run_vrad(args: List[str]) -> None:
         sys.exit(code)
 
 
-async def main(argv: List[str]) -> None:
+async def main(argv: list[str]) -> None:
     """Main VRAD script."""
     LOGGER.info(
-        "BEE{} VRAD hook initiallised, srctools v{}, Hammer Addons v{}",
-        utils.BEE_VERSION, srctools.__version__, version_haddons,
+        "BEE{} VRAD hook initialised, srctools v{}, Hammer Addons v{}",
+        utils.BEE_VERSION, srctools.__version__, utils.HA_VERSION,
     )
 
     # Warn if srctools Cython code isn't installed.
@@ -143,9 +152,9 @@ async def main(argv: List[str]) -> None:
         path += ".bsp"
 
     if not os.path.exists(path):
-        raise ValueError('"{}" does not exist!'.format(path))
+        raise ValueError(f'"{path}" does not exist!')
     if not os.path.isfile(path):
-        raise ValueError('"{}" is not a file!'.format(path))
+        raise ValueError(f'"{path}" is not a file!')
 
     LOGGER.info('Reading BSP')
     bsp_file = BSP(path)
@@ -192,6 +201,7 @@ async def main(argv: List[str]) -> None:
     if not is_peti:
         # Skip everything, if the user wants these features install the Hammer Addons postcompiler.
         LOGGER.info("Hammer map detected! Skipping all transforms.")
+        await trio.lowlevel.checkpoint()
         run_vrad(full_args)
         return
 
@@ -211,7 +221,8 @@ async def main(argv: List[str]) -> None:
     zipfile = ZipFile(zip_data)
 
     # Mount the existing packfile, so the cubemap files are recognised.
-    fsys.add_sys(ZipFileSystem('<BSP pakfile>', zipfile))
+    pakfile_fs = ZipFileSystem('<BSP pakfile>', zipfile)
+    fsys.add_sys(pakfile_fs)
 
     LOGGER.info('Done!')
 
@@ -219,18 +230,16 @@ async def main(argv: List[str]) -> None:
     for child_sys in fsys.systems[:]:
         LOGGER.debug('- {}: {!r}', child_sys[1], child_sys[0])
 
-    LOGGER.info('Reading our FGD files...')
-    fgd = FGD.engine_dbase()
-
     packlist = PackList(fsys)
     LOGGER.info('Reading soundscripts...')
     packlist.load_soundscript_manifest(root_folder / 'bin/bee2/sndscript_cache.dmx')
 
     # We need to add all soundscripts in scripts/bee2_snd/
     # This way we can pack those, if required.
-    for soundscript in fsys.walk_folder('scripts/bee2_snd/'):
-        if soundscript.path.endswith('.txt'):
-            packlist.load_soundscript(soundscript, always_include=False)
+    for folder in ['scripts/bee2_snd/', 'scripts/bee_snd/']:
+        for soundscript in fsys.walk_folder(folder):
+            if soundscript.path.endswith('.txt'):
+                packlist.load_soundscript(soundscript, always_include=False)
 
     LOGGER.info('Reading particles....')
     packlist.load_particle_manifest(root_folder / 'bin/bee2/particle_cache.dmx')
@@ -244,22 +253,30 @@ async def main(argv: List[str]) -> None:
     LOGGER.info('Run transformations...')
     await run_transformations(bsp_file.ents, fsys, packlist, bsp_file, game)
 
-    enable_packing = not is_preview or config.getboolean("General", "packfile_auto_enable", True)
-    if enable_packing:
+    if '-no_pack' not in args and (
+        not is_preview or config.getboolean("General", "packfile_auto_enable", True)
+    ):
         LOGGER.info('Scanning map for files to pack:')
         packlist.pack_from_bsp(bsp_file)
-        packlist.pack_fgd(bsp_file.ents, fgd)
-        packlist.eval_dependencies()
+        packlist.pack_from_ents(bsp_file.ents, Path(path).stem, ['P2'])
         LOGGER.info('Done!')
-
-        packlist.write_soundscript_manifest()
-        packlist.write_particles_manifest(f'maps/{Path(path).stem}_particles.txt')
     else:
         LOGGER.warning('Packing disabled!')
 
+    LOGGER.info('Analysing file dependencies....')
+    packlist.eval_dependencies()
+
+    packlist.write_soundscript_manifest()
+    packlist.write_particles_manifest(f'maps/{Path(path).stem}_particles.txt')
+
+    # Replace tools/toolsinvisible temporarily, the original blocks light annoyingly.
+    # Do it after packing, so it isn't packed. We'll swap back to the original,
+    # so it's not necessary.
+    swap_material(bsp_file, TEX_INVISIBLE_TOOLS, TEX_INVISIBLE_PATCHED)
+
     # We need to disallow Valve folders.
     pack_whitelist: set[FileSystem] = set()
-    pack_blacklist: set[FileSystem] = set()
+    pack_blacklist: set[FileSystem] = {pakfile_fs}
 
     # Exclude absolutely everything except our folder.
     for child_sys, _ in fsys.systems:
@@ -281,40 +298,52 @@ async def main(argv: List[str]) -> None:
     else:
         dump_loc = None
 
-    if '-no_pack' not in args and enable_packing:
-        # Cubemap files packed into the map already.
-        existing = set(bsp_file.pakfile.namelist())
+    LOGGER.info('Writing BSP...')
+    bsp_file.save()
+    LOGGER.info(' - BSP written!')
 
-        LOGGER.info('Writing to BSP...')
-        packlist.pack_into_zip(
-            bsp_file,
-            ignore_vpk=True,
-            whitelist=pack_whitelist,
-            blacklist=pack_blacklist,
-            dump_loc=dump_loc,
-        )
+    # VRAD only runs if light_args is not set to "NONE"
+    if light_args == 'FAST':
+        LOGGER.info("Running VRAD: forcing cheap lighting.")
+        run_vrad(fast_args)
+    elif light_args == 'FULL':
+        LOGGER.info("Running VRAD: full lighting enabled (publishing, or forced to do so)")
+        run_vrad(full_args)
+    else:
+        LOGGER.info("Running VRAD was skipped!")
 
-        LOGGER.info('Packed files:\n{}', '\n'.join(
-            set(bsp_file.pakfile.namelist()) - existing
-        ))
+    LOGGER.info("VRAD completed. Reopening and packing files.")
+
+    bsp_file = BSP(path)
+
+    # Cubemap files packed into the map already.
+    existing = set(bsp_file.pakfile.namelist())
+
+    # Pack to the BSP *after* running VRAD, to ensure an extra-large packfile doesn't crash
+    # VRAD.
+    LOGGER.info('Writing packed files to BSP...')
+    packlist.pack_into_zip(
+        bsp_file,
+        ignore_vpk=True,
+        whitelist=pack_whitelist,
+        blacklist=pack_blacklist,
+        dump_loc=dump_loc,
+    )
+    # Put this back.
+    swap_material(bsp_file, TEX_INVISIBLE_PATCHED, TEX_INVISIBLE_TOOLS)
 
     LOGGER.info('Writing BSP...')
     bsp_file.save()
     LOGGER.info(' - BSP written!')
 
+    LOGGER.info('Packed files:\n{}', '\n'.join(
+        set(bsp_file.pakfile.namelist()) - existing
+    ))
+
     screenshot.modify(config, game.path)
 
-    # VRAD only runs if light_args is not set to "NONE"
-    if light_args == 'FAST':
-        LOGGER.info("Forcing Cheap Lighting!")
-        run_vrad(fast_args)
-    elif light_args == 'FULL':
-        LOGGER.info("Publishing - Full lighting enabled! (or forced to do so)")
-        run_vrad(full_args)
-    else:
-        LOGGER.info("Forcing to skip VRAD!")
-
     LOGGER.info("BEE2 VRAD hook finished!")
+
 
 if __name__ == '__main__':
     trio.run(main, sys.argv)

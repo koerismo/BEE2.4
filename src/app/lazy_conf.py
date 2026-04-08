@@ -1,110 +1,126 @@
 """Implements callables which lazily parses and combines config files."""
 from __future__ import annotations
-from typing import Callable, Pattern
+from typing import Final
+
+from collections.abc import Awaitable, Callable
 import functools
+import re
 
+from srctools import KeyValError, Keyvalues, logger
 import trio
-from srctools import Property, logger, KeyValError
-from srctools.filesys import File
 
-import app
 import packages
 import utils
 
 
 LOGGER = logger.get_logger(__name__)
-LazyConf = Callable[[], Property]
-# Empty property.
-BLANK: LazyConf = lambda: Property.root()
+type LazyConf = Callable[[], Awaitable[Keyvalues]]
 
 
-def raw_prop(block: Property, source: str= '') -> LazyConf:
+async def _blank_prop() -> Keyvalues:
+	"""An empty config. This is used as a singleton."""
+	await trio.lowlevel.checkpoint()
+	return Keyvalues.root()
+
+
+BLANK: Final[LazyConf] = _blank_prop
+
+
+def raw_prop(block: Keyvalues, source: str = '') -> LazyConf:
 	"""Make an existing property conform to the interface."""
 	if block or block.name is not None:
 		if source:
-			def copier() -> Property:
+			async def copy_with_source() -> Keyvalues:
 				"""Copy the config, then apply the source."""
+				await trio.lowlevel.checkpoint()
 				copy = block.copy()
 				packages.set_cond_source(copy, source)
 				return copy
-			return copier
-		else:  # We can just use the bound method.
-			return block.copy
+			return copy_with_source
+		else:
+			async def copy_no_source() -> Keyvalues:
+				"""Just copy the block."""
+				await trio.lowlevel.checkpoint()
+				return block.copy()
+
+			return copy_no_source
 	else:  # If empty, source is irrelevant, and we can use the constant.
 		return BLANK
 
 
-def from_file(path: utils.PackagePath, missing_ok: bool=False, source: str= '') -> LazyConf:
+async def from_file(
+	packset: packages.PackagesSet,
+	path: utils.PackagePath,
+	*,
+	missing_ok: bool = False, source: str = '',
+) -> LazyConf:
 	"""Lazily load the specified config."""
 	try:
-		fsys = packages.PACKAGE_SYS[path.package]
+		# If package is a special ID, this will fail.
+		pack = packset.packages[utils.ObjectID(path.package)]
 	except KeyError:
+		await trio.lowlevel.checkpoint()
 		if not missing_ok:
 			LOGGER.warning('Package does not exist: "{}"', path)
 		return BLANK
 	try:
-		file = fsys[path.path]
+		file = await trio.to_thread.run_sync(pack.fsys.__getitem__, path.path)
 	except FileNotFoundError:
+		await trio.lowlevel.checkpoint()
 		if not missing_ok:
 			LOGGER.warning('File does not exist: "{}"', path)
 		return BLANK
 
-	def loader() -> Property:
+	async def loader() -> Keyvalues:
 		"""Load and parse the specified file when called."""
-		try:
+		def worker() -> Keyvalues:
+			"""Run this in a background thread."""
 			with file.open_str() as f:
-				props = Property.parse(f)
+				kv = Keyvalues.parse(f, periodic_callback=trio.from_thread.check_cancelled)
+			if source:
+				packages.set_cond_source(kv, source)
+			return kv
+		try:
+			kv = await trio.to_thread.run_sync(worker, abandon_on_cancel=True)
 		except (KeyValError, FileNotFoundError, UnicodeDecodeError):
 			LOGGER.exception('Unable to read "{}"', path)
 			raise
-		if source:
-			packages.set_cond_source(props, source)
-		return props
+		return kv
 
-	if app.DEV_MODE.get():
-		app.background_run(devmod_check, file, path)
+	if packset.devmode_filecheck_chan is not None:
+		await packset.devmode_filecheck_chan.send((path, file))
 	return loader
-
-
-async def devmod_check(file: File, path: utils.PackagePath) -> None:
-	"""In dev mode, parse files in the background to ensure they exist and have valid syntax."""
-	# Parse immediately, to check syntax.
-	try:
-		with file.open_str() as f:
-			await trio.to_thread.run_sync(Property.parse, f, cancellable=True)
-	except (KeyValError, FileNotFoundError, UnicodeDecodeError):
-		LOGGER.exception('Unable to read "{}"', path)
 
 
 def concat(a: LazyConf, b: LazyConf) -> LazyConf:
 	"""Concatenate the two configs together."""
 	# Catch a raw property being passed in.
-	assert callable(a) and callable(b), (a, b)
+	assert callable(a) and callable(b), (a, b)  # type: ignore[redundant-expr]
 	# If either is blank, this is a no-op, so avoid a pointless layer.
 	if a is BLANK:
 		return b
 	if b is BLANK:
 		return a
 
-	def concat_inner() -> Property:
+	async def concat_inner() -> Keyvalues:
 		"""Resolve then merge the configs."""
-		prop = Property.root()
-		prop.extend(a())
-		prop.extend(b())
-		return prop
+		kv = Keyvalues.root()
+		kv.extend(await a())
+		kv.extend(await b())
+		return kv
 	return concat_inner
 
 
-def replace(base: LazyConf, replacements: list[tuple[Pattern[str], str]]) -> LazyConf:
+def replace(base: LazyConf, replacements: list[tuple[re.Pattern[str], str]]) -> LazyConf:
 	"""Replace occurances of values in the base config."""
 	rep_funcs = [
 		functools.partial(pattern.sub, repl)
 		for pattern, repl in replacements
 	]
 
-	def replacer() -> Property:
+	async def replacer() -> Keyvalues:
 		"""Replace values."""
-		copy = base()
+		copy = await base()
 		for prop in copy.iter_tree():
 			name = prop.real_name
 			if name is not None:

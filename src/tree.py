@@ -1,19 +1,19 @@
 """Wraps the Rtree package, adding typing and usage of our Vec class."""
+from collections.abc import Iterator
+
+from rtree import index
 from srctools.math import Vec
-from typing import Generic, TypeVar, Iterator, List, Tuple
-
 import attrs
-from rtree import index  # type: ignore
 
-ValueT = TypeVar('ValueT')
+
 PROPS = index.Property()
 PROPS.dimension = 3
 
 
 @attrs.frozen
-class ValueHolder(Generic[ValueT]):
+class ValueHolder[ValueT]:
     """Holds the list of values."""
-    values: List[ValueT]
+    values: list[ValueT]
     min_x: float
     min_y: float
     min_z: float
@@ -22,22 +22,26 @@ class ValueHolder(Generic[ValueT]):
     max_z: float
 
 
-class RTree(Generic[ValueT]):
+class RTree[ValueT]:
     """A 3-dimensional R-Tree. Multiple values with the same bbox are allowed."""
+    tree: index.Index
+    # id(holder) -> holder.
+    # We can't store the object directly in the tree.
+    _by_id: dict[int, ValueHolder[ValueT]]
+    _by_coord: dict[
+        tuple[float, float, float, float, float, float],
+        ValueHolder[ValueT]
+    ]
+
     def __init__(self) -> None:
         self.tree = index.Index(properties=PROPS)
-        # id(holder) -> holder.
-        # We can't store the object directly in the tree.
-        self._by_id: dict[int, ValueHolder[ValueT]] = {}
-        self._by_coord: dict[
-            tuple[float, float, float, float, float, float],
-            ValueHolder[ValueT]
-        ] = {}
+        self._by_id = {}
+        self._by_coord = {}
 
     def __len__(self) -> int:
         return sum(len(holder.values) for holder in self._by_id.values())
 
-    def __iter__(self) -> Iterator[Tuple[Vec, Vec, ValueT]]:
+    def __iter__(self) -> Iterator[tuple[Vec, Vec, ValueT]]:
         """Iterating over the tree returns each bbox and value associated with it."""
         for holder in self._by_id.values():
             mins = Vec(holder.min_x, holder.min_y, holder.min_z)

@@ -1,16 +1,21 @@
 """Manages parsing and regenerating antlines."""
 from __future__ import annotations
+from typing import Protocol, final
+
+from collections.abc import Iterator, Callable, Mapping, Sequence
 from collections import defaultdict
-from collections.abc import Iterator, Container
 from enum import Enum
 import math
 
 import attrs
-from srctools import Vec, Matrix, Property, conv_float, logger
-from srctools.vmf import VMF, overlay_bounds, make_overlay
+from srctools import EmptyMapping, FrozenVec, Vec, Matrix, Keyvalues, conv_float, logger
+from srctools.vmf import Entity, Output, VMF, overlay_bounds, make_overlay
 
-from precomp import tiling, rand
+import utils
+from precomp import options, rand
+from connections import get_outputs, TimerModes, INDICATOR_CHECK_ID, INDICATOR_TIMER_ID
 import consts
+import editoritems
 
 
 LOGGER = logger.get_logger(__name__)
@@ -22,6 +27,21 @@ class SegType(Enum):
     CORNER = 1
 
 
+class PanelSwitchingStyle(Enum):
+    """How the panel instance does its switching."""
+    CUSTOM = 'custom'      # Some logic, we don't do anything.
+    EXTERNAL = 'external'  # Provide a toggle to the instance.
+    INTERNAL = 'internal'  # The inst has a toggle or panel, so we can reuse it.
+
+
+class OverBinder(Protocol):
+    """An object representing some brushes that can have overlays bound to it.
+
+    In practice this is a TileDef.
+    """
+    def bind_overlay(self, over: Entity, /) -> None: ...
+
+
 @attrs.define
 class AntTex:
     """Represents a single texture, and the parameters it has."""
@@ -29,63 +49,78 @@ class AntTex:
     scale: float
     static: bool
 
-    @staticmethod
-    def parse(prop: Property):
-        """Parse from property values.
+    @classmethod
+    def parse(cls, kv: Keyvalues) -> AntTex:
+        """Parse from keyvalue blocks.
 
         The value can be in four forms:
-        "prop" "material"
-        "prop" "<scale>|material"
-        "prop" "<scale>|material|static"
-        "prop"
+        "antline_kind" "material"
+        "antline_kind" "<scale>|material"
+        "antline_kind" "<scale>|material|static"
+        "antline_kind"
             {
             "tex"    "<mat>"
             "scale"  "<scale>"
             "static" "<is_static>"
             }
         """
-        if prop.has_children():
-            tex = prop['tex']
-            scale = prop.float('scale', 0.25)
-            static = prop.bool('static')
+        if kv.has_children():
+            tex = kv['tex']
+            scale = kv.float('scale', 0.25)
+            static = kv.bool('static')
         else:
-            vals = prop.value.split('|')
-            opts: Container[str] = ()
-            scale_str = '0.25'
+            match kv.value.split('|'):
+                case [scale_str, tex]:
+                    scale = conv_float(scale_str, 0.25)
+                    static = False
+                case [scale_str, tex, 'static']:
+                    scale = conv_float(scale_str, 0.25)
+                    static = True
+                case [tex]:
+                    scale = 0.25
+                    static = False
+                case _:
+                    raise ValueError(
+                        f'''Invalid antline material config "{kv.value}"! Valid forms:
+- "antline_kind" "material"
+- "antline_kind" "<scale>|material"
+- "antline_kind" "<scale>|material|static"
+"antline_kind"
+    {{
+    "tex"    "<mat>"
+    "scale"  "<scale>"
+    "static" "<is_static>"
+    }}
+''')
 
-            if len(vals) == 2:
-                scale_str, tex = vals
-            elif len(vals) > 2:
-                scale_str, tex, *opts = vals
-            else:
-                # Unpack to ensure it only has 1 section
-                [tex] = vals
-            scale = conv_float(scale_str, 0.25)
-            static = 'static' in opts
-
-        return AntTex(tex, scale, static)
+        return cls(tex, scale, static)
 
 
-@attrs.define(eq=False)
+@attrs.define(eq=False, kw_only=True)
 class AntType:
     """Defines the style of antline to use.
 
-    For broken antlines, 'broken_chance' is the percentage chance for brokenness
-    per dot.
-
     Corners can be omitted, if corner/straight antlines are the same.
+
+    broken_chance: percentage chance for brokenness per dot.
+    broken_min: Straight antlines must be at least this long to be eligable for brokenness.
+    broken_max_run: Force working antlines if this many broken ones are in a row.
     """
     tex_straight: list[AntTex]
     tex_corner: list[AntTex]
 
-    broken_straight: list[AntTex]
-    broken_corner: list[AntTex]
-    broken_chance: float
+    broken_straight: list[AntTex] = attrs.Factory(list)
+    broken_corner: list[AntTex] = attrs.Factory(list)
+    broken_chance: float = 0.0
+    broken_min: int = 0
+    broken_max_run: int = 1
 
     @classmethod
-    def parse(cls, prop: Property) -> AntType:
+    def parse(cls, kv: Keyvalues) -> AntType:
         """Parse this from a property block."""
-        broken_chance = prop.float('broken_chance')
+        broken_chance = kv.float('broken_chance', 0.0)
+        broken_min = kv.int('broken_min', 0)
+        broken_max_run = kv.int('broken_max_run', 1)
         tex_straight: list[AntTex] = []
         tex_corner: list[AntTex] = []
         brok_straight: list[AntTex] = []
@@ -93,41 +128,279 @@ class AntType:
         for ant_list, name in zip(
             [tex_straight, tex_corner, brok_straight, brok_corner],
             ('straight', 'corner', 'broken_straight', 'broken_corner'),
+            strict=True,
         ):
-            for sub_prop in prop.find_all(name):
+            for sub_prop in kv.find_all(name):
                 ant_list.append(AntTex.parse(sub_prop))
 
         if broken_chance < 0.0:
-            LOGGER.warning('Antline broken chance must be between 0-100, got "{}"!', prop['broken_chance'])
+            LOGGER.warning('Antline broken chance must be between 0-100, got "{}"!', kv['broken_chance'])
             broken_chance = 0.0
         if broken_chance > 100.0:
-            LOGGER.warning('Antline broken chance must be between 0-100, got "{}"!', prop['broken_chance'])
+            LOGGER.warning('Antline broken chance must be between 0-100, got "{}"!', kv['broken_chance'])
             broken_chance = 100.0
+        if broken_min < 0:
+            LOGGER.warning('Antline broken minumum must be positive, got "{}"!', kv['broken_min'])
+            broken_min = 0
+        if broken_max_run < 1:
+            LOGGER.warning('Antline broken max run must be at least 1, got "{}"!', kv['broken_max_run'])
+            broken_max_run = 1
 
         if broken_chance == 0.0:
             brok_straight.clear()
             brok_corner.clear()
+            broken_min = 0
+            broken_max_run = 1
 
         # Cannot have broken corners if corners/straights are the same.
         if not tex_corner:
             brok_corner.clear()
 
         return cls(
-            tex_straight,
-            tex_corner,
-            brok_straight,
-            brok_corner,
-            broken_chance,
+            tex_straight=tex_straight, tex_corner=tex_corner,
+            broken_straight=brok_straight, broken_corner=brok_corner,
+            broken_chance=broken_chance,
+            broken_min=broken_min,
+            broken_max_run=broken_max_run,
         )
 
     @classmethod
     def default(cls) -> AntType:
         """Make a copy of the original PeTI antline config."""
         return AntType(
-            [AntTex(consts.Antlines.STRAIGHT, 0.25, False)],
-            [AntTex(consts.Antlines.CORNER, 1, False)],
-            [], [], 0,
+            tex_straight=[AntTex(consts.Antlines.STRAIGHT, 0.25, False)],
+            tex_corner=[AntTex(consts.Antlines.CORNER, 1.0, False)],
         )
+
+
+@attrs.frozen(eq=False)
+class State:
+    """A specific state to set a custom indicator to.
+
+    This decouples the item from setting skins, allowing it to work with antlasers as well as overlays.
+    """
+    name: str  # Name of relay to create.
+
+    frame: int  # Antline texture frame.
+    beam_colour: str  # Colour for beam, if present.
+    glow_colour: str  # Colour for glow sprite, if present.
+    antlaser_skin: int  # Model skin.
+
+    @classmethod
+    def parse(cls, kv: Keyvalues) -> State:
+        """Parse from keyvalues."""
+        frame = kv.int('tex_frame')
+        beam_colour = kv['antlaser_beam_colour', kv['antlaser_beam_color', '255 255 255']]
+        glow_colour = kv['antlaser_glow_colour', kv['antlaser_glow_color', beam_colour]]
+        skin = kv.int('antlaser_skin')
+        return cls(
+            name=kv.name,
+            frame=frame,
+            beam_colour=beam_colour,
+            glow_colour=glow_colour,
+            antlaser_skin=skin,
+        )
+
+
+@final
+@attrs.frozen(eq=False, kw_only=True)
+class IndicatorStyle:
+    """Represents complete configuration for antlines and indicator panels."""
+    wall: AntType
+    floor: AntType
+
+    # Instance to use for checkmark signs, or blank if they should not be used.
+    check_inst: str
+    check_switching: PanelSwitchingStyle
+    # Sign inputs to swap the two versions.
+    check_cmd: Sequence[Output]
+    cross_cmd: Sequence[Output]
+
+    # Instance to use for timer signs, or blank if they should not be used.
+    timer_inst: str
+    timer_switching: PanelSwitchingStyle
+    # Outputs to use for the advanced version to swap skins, and to control the indicator.
+    timer_blue_cmd: Sequence[Output]
+    timer_oran_cmd: Sequence[Output]
+    timer_adv_cmds: Mapping[TimerModes, Sequence[Output]]
+    # And the simplified on/off inputs.
+    timer_basic_start_cmd: Sequence[Output]
+    timer_basic_stop_cmd: Sequence[Output]
+
+    # If set, the item has special antlines. This is a fixup var,
+    # which gets the antline name filled in for us.
+    # Deprecated, use the modes instead.
+    toggle_var: str
+    # A list of states that are available for this antline set. Each is generated as a comp_relay,
+    # overriding the default on/off behaviour.
+    states: Sequence[State]
+    # If states are defined, the initial one.
+    initial_state: State | None
+    # If not blank, override the antlaser model
+    antlaser_model: str
+
+    @classmethod
+    def parse(cls, kv: Keyvalues, desc: str, parent: IndicatorStyle) -> IndicatorStyle:
+        """Parse the style from a configuration block.
+
+        If sections are not specified, they will be inherited from the parent.
+        """
+        return cls.parser(kv, desc)(parent)
+
+    @classmethod
+    def parser(cls, kv: Keyvalues, desc: str) -> Callable[[IndicatorStyle], IndicatorStyle]:
+        """Parse the style from a configuration block.
+
+        This parses immediately, then returns a callable to allows passing in the parent to inherit
+        from later.
+        """
+        wall: AntType | None = None
+        floor: AntType | None = None
+        if 'floor' in kv:
+            floor = AntType.parse(kv.find_key('floor'))
+        if 'wall' in kv:
+            wall = AntType.parse(kv.find_key('wall'))
+
+        # Allow 'antline' to specify both.
+        if wall is None and floor is None:
+            if 'antline' in kv:
+                wall = floor = AntType.parse(kv.find_key('antline'))
+            # If both are not there but some textures are, allow omitting the subkey.
+            elif 'straight' in kv or 'corner' in kv:
+                wall = floor = AntType.parse(kv)
+
+        # If only one is defined, use that for both.
+        if wall is None and floor is not None:
+            wall = floor
+        elif floor is None and wall is not None:
+            floor = wall
+
+        timer_inst: str | None = None
+        check: tuple[str, list[Output], list[Output]] | None = None
+        timer_adv_cmds: dict[TimerModes, Sequence[Output]] = {}
+        timer_blue_cmd: list[Output] | None = None
+        timer_oran_cmd: list[Output] | None = None
+        timer_basic_start_cmd: list[Output] | None = None
+        timer_basic_stop_cmd: list[Output] | None = None
+        check_switching = PanelSwitchingStyle.CUSTOM
+        timer_switching = PanelSwitchingStyle.CUSTOM
+
+        toggle_var = kv['toggle_var', '']
+        if toggle_var:
+            LOGGER.warning(
+                'Antline toggle var "{}" for {} is deprecated, prefer state definitions '
+                'to allow compatibility with antlasers.',
+                toggle_var, desc,
+            )
+        states = [
+            State.parse(mode_kv)
+            for mode_kv in kv.find_children('states')
+        ]
+        initial_state: State | None
+        if states:
+            initial_state_name = kv['initial_state'].casefold()
+            for state in states:
+                if state.name.casefold() == initial_state_name:
+                    initial_state = state
+                    break
+            else:
+                raise ValueError(f'Initial state "{initial_state_name}" does not exist!')
+        else:
+            initial_state = None
+        antlaser_model = kv['antlaser_model', '']
+
+        check_kv = kv.find_block('check', or_blank=True)
+        if bool(check_kv):
+            check_inst = check_kv['inst']
+            try:
+                check_switching = PanelSwitchingStyle(check_kv['switching'])
+            except (LookupError, ValueError):
+                check_switching = PanelSwitchingStyle.CUSTOM  # Assume no optimisations
+            check_cmd = get_outputs(check_kv, desc, 'check_cmd')
+            cross_cmd = get_outputs(check_kv, desc, 'cross_cmd')
+            check = check_inst, check_cmd, cross_cmd
+
+        timer_kv = kv.find_block('timer', or_blank=True)
+        if bool(timer_kv):
+            timer_inst = timer_kv['inst']
+            try:
+                timer_switching = PanelSwitchingStyle(timer_kv['switching'])
+            except (LookupError, ValueError):
+                timer_switching = PanelSwitchingStyle.CUSTOM  # Assume no optimisations
+            timer_blue_cmd = get_outputs(timer_kv, desc, 'blue_cmd')
+            timer_oran_cmd = get_outputs(timer_kv, desc, 'oran_cmd')
+            timer_basic_start_cmd = get_outputs(timer_kv, desc, 'basic_start_cmd')
+            timer_basic_stop_cmd = get_outputs(timer_kv, desc, 'basic_stop_cmd')
+            for mode in TimerModes:
+                outs = get_outputs(timer_kv, desc, f'adv_{mode.value}_cmd')
+                if outs:
+                    timer_adv_cmds[mode] = outs
+
+        def build(parent: IndicatorStyle) -> IndicatorStyle:
+            """Build the config, using parent params if not specified."""
+            conf = attrs.evolve(
+                parent,
+                wall=wall or parent.wall,
+                floor=floor or parent.floor,
+                toggle_var=toggle_var,
+                states=states,
+                initial_state=initial_state,
+                antlaser_model=antlaser_model,
+            )
+            if check is not None:
+                check_inst, check_cmd, cross_cmd = check
+                conf = attrs.evolve(
+                    conf,
+                    check_inst=check_inst,
+                    check_switching=check_switching,
+                    check_cmd=check_cmd,
+                    cross_cmd=cross_cmd,
+                )
+            if timer_inst is not None:
+                conf = attrs.evolve(
+                    conf,
+                    timer_inst=timer_inst,
+                    timer_switching=timer_switching,
+                    timer_adv_cmds=timer_adv_cmds or EmptyMapping,
+                    timer_blue_cmd=timer_blue_cmd or (),
+                    timer_oran_cmd=timer_oran_cmd or (),
+                    timer_basic_start_cmd=timer_basic_start_cmd or (),
+                    timer_basic_stop_cmd=timer_basic_stop_cmd or (),
+                )
+            return conf
+        return build
+
+    @classmethod
+    def from_legacy(cls, id_to_item: dict[utils.ObjectID, editoritems.Item]) -> IndicatorStyle:
+        """Produce the original legacy configs by reading from editoritems."""
+        check_item = id_to_item[INDICATOR_CHECK_ID]
+        timer_item = id_to_item[INDICATOR_TIMER_ID]
+
+        return cls(
+            wall=AntType.default(),
+            floor=AntType.default(),
+            check_inst=str(check_item.instances[0].inst) if check_item.instances else '',
+            check_switching=options.IND_PAN_CHECK_SWITCHING.as_enum(PanelSwitchingStyle),
+            check_cmd=check_item.conn_config.enable_cmd if check_item.conn_config is not None else (),
+            cross_cmd=check_item.conn_config.disable_cmd if check_item.conn_config is not None else (),
+
+            timer_inst=str(timer_item.instances[0].inst) if timer_item.instances else '',
+            timer_switching=options.IND_PAN_TIMER_SWITCHING.as_enum(PanelSwitchingStyle),
+            timer_basic_start_cmd=timer_item.conn_config.enable_cmd if timer_item.conn_config is not None else (),
+            timer_basic_stop_cmd=timer_item.conn_config.disable_cmd if timer_item.conn_config is not None else (),
+            # No advanced configs
+            timer_adv_cmds=EmptyMapping,
+            timer_blue_cmd=(),
+            timer_oran_cmd=(),
+            toggle_var='',
+            states=(),
+            initial_state=None,
+            antlaser_model='',
+        )
+
+    def has_advanced_timer(self) -> bool:
+        """Check if this has advanced timer options."""
+        return bool(self.timer_adv_cmds)
 
 
 @attrs.define(eq=False)
@@ -141,41 +414,51 @@ class Segment:
     start: Vec
     end: Vec
     # The brushes this segment is attached to.
-    tiles: set[tiling.TileDef] = attrs.Factory(set)
+    tiles: set[OverBinder] = attrs.Factory(set)
 
     @property
     def on_floor(self) -> bool:
         """Return if this segment is on the floor/wall."""
         return abs(self.normal.z) > 1e-6
 
-    def broken_iter(
-        self,
-        chance: float,
-    ) -> Iterator[tuple[Vec, Vec, bool]]:
+    @property
+    def count(self) -> int:
+        """Return the number of 'dots' in this segment."""
+        offset = self.end - self.start
+        return int(offset.mag() // 16)
+
+    def broken_iter(self, conf: AntType) -> Iterator[tuple[Vec, Vec, bool]]:
         """Iterator to compute positions for straight segments.
 
         This produces point pairs which fill the space from 0-dist.
         Neighbouring sections will be merged when they have the same
         type.
         """
-        rng = rand.seed(b'ant_broken', self.start, self.end, chance)
+        chance = conf.broken_chance
+        rng = rand.seed(b'ant_broken', self.start, self.end, float(chance))
         offset = self.end - self.start
         dist = offset.mag() // 16
-        norm = 16 * offset.norm()
+        forward = 16 * offset.norm()
 
-        if dist < 3 or chance == 0:
-            # Short antlines always are either on/off.
-            yield self.start, self.end, (rng.randrange(100) < chance)
+        if dist < conf.broken_min or chance == 0.0:
+            # Short antlines must always be on.
+            yield self.start, self.end, False
         else:
             run_start = self.start
-            last_type = rng.randrange(100) < chance
+            run_broken = rng.randrange(100) < chance
+            run_size = 0
             for i in range(1, int(dist)):
-                next_type = rng.randrange(100) < chance
-                if next_type != last_type:
-                    yield run_start, self.start + i * norm, last_type
-                    last_type = next_type
-                    run_start = self.start + i * norm
-            yield run_start, self.end, last_type
+                if run_broken and run_size >= conf.broken_max_run:
+                    next_broken = False
+                else:
+                    next_broken = rng.randrange(100) < chance
+                if next_broken is not run_broken:
+                    yield run_start, self.start + i * forward, run_broken
+                    run_broken = next_broken
+                    run_size = 0
+                    run_start = self.start + i * forward
+                run_size += 1
+            yield run_start, self.end, run_broken
 
 
 @attrs.define(eq=False)
@@ -184,7 +467,11 @@ class Antline:
     name: str
     line: list[Segment]
 
-    def export(self, vmf: VMF, *, wall_conf: AntType, floor_conf: AntType) -> None:
+    def export(
+        self,
+        vmf: VMF, style: IndicatorStyle,
+        tile_for: Callable[[FrozenVec, FrozenVec], OverBinder | None],
+    ) -> None:
         """Add the antlines into the map."""
 
         # First, do some optimisation. If corners aren't defined, try and
@@ -192,12 +479,12 @@ class Antline:
         # before/after it into the corners.
 
         collapse_line: list[Segment | None]
-        if not wall_conf.tex_corner or not floor_conf.tex_corner:
+        if not style.wall.tex_corner or not style.floor.tex_corner:
             collapse_line = list(self.line)
             for i, seg in enumerate(collapse_line):
                 if seg is None or seg.type is not SegType.STRAIGHT:
                     continue
-                if (floor_conf if seg.on_floor else wall_conf).tex_corner:
+                if (style.floor if seg.on_floor else style.wall).tex_corner:
                     continue
                 for corner_ind in [i-1, i+1]:
                     if i == -1:
@@ -233,8 +520,8 @@ class Antline:
             self.line[:] = [seg for seg in collapse_line if seg is not None]
             LOGGER.info('Collapsed {} antline corners', collapse_line.count(None))
 
-        for seg in self.line:
-            conf = floor_conf if seg.on_floor else wall_conf
+        for neigh_prev, seg, neigh_next in utils.iter_neighbours(self.line):
+            conf = style.floor if seg.on_floor else style.wall
             # Check tiledefs in the voxels, and assign just in case.
             # antline corner items don't have them defined, and some embed-faces don't work
             # properly. But we keep any segments actually defined also.
@@ -245,17 +532,28 @@ class Antline:
                 pos[u_axis] = pos[u_axis] // 128 * 128 + 64
                 pos[v_axis] = pos[v_axis] // 128 * 128 + 64
                 pos -= 64 * seg.normal
-                try:
-                    tile = tiling.TILES[pos.as_tuple(), seg.normal.as_tuple()]
-                except KeyError:
-                    pass
-                else:
+                tile = tile_for(pos.freeze(), seg.normal.freeze())
+                if tile is not None:
                     seg.tiles.add(tile)
 
             rng = rand.seed(b'antline', seg.start, seg.end)
             if seg.type is SegType.CORNER:
                 mat: AntTex
-                if rng.randrange(100) < conf.broken_chance:
+                # Corners can only break if a neighbour is a straight with the same normal
+                # and that matches the min length.
+                # That ensures a working antline should be visible near it.
+                allow_break = (
+                    neigh_prev is not None
+                    and neigh_prev.type is SegType.STRAIGHT
+                    and neigh_prev.count >= conf.broken_min
+                    and Vec.dot(neigh_prev.normal, seg.normal) > 0.9
+                ) or (
+                    neigh_next is not None
+                    and neigh_next.type is SegType.STRAIGHT
+                    and neigh_next.count >= conf.broken_min
+                    and Vec.dot(neigh_next.normal, seg.normal) > 0.9
+                )
+                if allow_break and rng.randrange(100) < conf.broken_chance:
                     mat = rng.choice(conf.broken_corner or conf.broken_straight)
                 else:
                     mat = rng.choice(conf.tex_corner or conf.tex_straight)
@@ -273,17 +571,15 @@ class Antline:
                     mat,
                 )
             else:  # Straight
-                # TODO: Break up these segments.
-                for a, b, is_broken in seg.broken_iter(conf.broken_chance):
-                    if is_broken:
-                        mat = rng.choice(conf.broken_straight)
-                    else:
-                        mat = rng.choice(conf.tex_straight)
-                    self._make_straight(
+                side = 16 * Vec.cross(seg.normal, seg.start - seg.end).norm()
+                for a, b, is_broken in seg.broken_iter(conf):
+                    mat = rng.choice(conf.broken_straight if is_broken else conf.tex_straight)
+                    self._make_overlay(
                         vmf,
                         seg,
-                        a,
-                        b,
+                        (a + b) / 2,
+                        a - b,
+                        side,
                         mat,
                     )
 
@@ -313,33 +609,6 @@ class Antline:
         for tile in segment.tiles:
             tile.bind_overlay(overlay)
 
-    def _make_straight(
-        self,
-        vmf: VMF,
-        segment: Segment,
-        start: Vec,
-        end: Vec,
-        mat: AntTex,
-    ) -> None:
-        """Construct a straight antline between two points.
-
-        The two points will be the end of the antlines.
-        """
-        offset = start - end
-        forward = offset.norm()
-        side = Vec.cross(segment.normal, forward).norm()
-
-        length = offset.mag()
-
-        self._make_overlay(
-            vmf,
-            segment,
-            (start + end) / 2,
-            length * forward,
-            16 * side,
-            mat,
-        )
-
 
 def parse_antlines(vmf: VMF) -> tuple[
     dict[str, list[Antline]],
@@ -362,13 +631,15 @@ def parse_antlines(vmf: VMF) -> tuple[
 
     # Points on antlines where two can connect. For corners that's each side, for straight it's
     # each end. Combine that with the targetname, so we only join related antlines.
-    join_points: dict[tuple[str, float, float, float], Segment] = {}
+    join_points: dict[tuple[str, FrozenVec], Segment] = {}
 
     mat_straight = consts.Antlines.STRAIGHT
     mat_corner = consts.Antlines.CORNER
 
     side_to_seg: dict[int, list[Segment]] = {}
     antlines: dict[str, list[Antline]] = {}
+    points: list[Vec]
+    single_straights: list[tuple[Segment, str]] = []
 
     for over in vmf.by_class['info_overlay']:
         mat = over['material']
@@ -402,7 +673,7 @@ def parse_antlines(vmf: VMF) -> tuple[
             start = round(start / 16, 0) * 16
             end = round(end / 16, 0) * 16
 
-            if math.isclose(Vec.dot(end - start, long_axis), 16.0):
+            if math.isclose(abs(Vec.dot(end - start, long_axis)), 16.0):
                 # Special case.
                 # 1-wide antlines don't have the correct
                 # rotation, pointing always in the U axis.
@@ -411,6 +682,7 @@ def parse_antlines(vmf: VMF) -> tuple[
                 start = end = origin
                 points = []
             else:
+                # These are the endpoints.
                 offset: Vec = round(abs(8 * side_axis), 0)
                 start += offset
                 end -= offset
@@ -423,6 +695,9 @@ def parse_antlines(vmf: VMF) -> tuple[
         seg = Segment(seg_type, normal, start, end)
         segment_to_name[seg] = over_name = over['targetname']
 
+        if not points:  # Single-straight
+            single_straights.append((seg, over_name))
+
         for side_id in over['sides'].split():
             side_to_seg.setdefault(int(side_id), []).append(seg)
 
@@ -430,7 +705,7 @@ def parse_antlines(vmf: VMF) -> tuple[
             # Lookup the point to see if we've already checked it.
             # If not, write us into that spot.
             neighbour = join_points.setdefault(
-                (over_name, ) + point.as_tuple(),
+                (over_name, round(point, 0).freeze()),
                 seg,
             )
             if neighbour is seg:
@@ -443,9 +718,8 @@ def parse_antlines(vmf: VMF) -> tuple[
         over.remove()
 
     # Now fix the square straight segments.
-    for seg, over_name in segment_to_name.items():
-        if seg.type is SegType.STRAIGHT and seg.start == seg.end:
-            fix_single_straight(seg, over_name, join_points, overlay_joins)
+    for seg, over_name in single_straights:
+        fix_single_straight(seg, over_name, join_points, overlay_joins)
 
     # Now, finally compute each continuous section.
     for start_seg, over_name in segment_to_name.items():
@@ -464,26 +738,26 @@ def parse_antlines(vmf: VMF) -> tuple[
             # Except KeyError: this segment's already done??
             for neighbour in neighbours:
                 if neighbour not in segments:
-                    segments.append(neighbour)
+                    segments.append(neighbour)  # noqa: B909 - appending to our own loop var
 
         antlines.setdefault(over_name, []).append(Antline(over_name, segments))
 
-    LOGGER.info('Done! ({} antlines)'.format(sum(map(len, antlines.values()))))
+    LOGGER.info(f'Done! ({sum(map(len, antlines.values()))} antlines)')
     return antlines, side_to_seg
 
 
 def fix_single_straight(
     seg: Segment,
     over_name: str,
-    join_points: dict[tuple[str, float, float, float], Segment],
+    join_points: dict[tuple[str, FrozenVec], Segment],
     overlay_joins: dict[Segment, set[Segment]],
 ) -> None:
     """Figure out the correct rotation for 1-long straight antlines."""
     # Check the U and V axis, to see if there's another antline on both
     # sides. If there is that's the correct orientation.
-    orient = Matrix.from_angle(seg.normal.to_angle())
+    orient = Matrix.from_basis(x=seg.normal)
 
-    center = seg.start.copy()
+    center = seg.start
 
     for off in [
         orient.left(-8.0),
@@ -492,7 +766,7 @@ def fix_single_straight(
         orient.up(+8.0),
     ]:
         try:
-            neigh = join_points[(over_name, ) + (center + off).as_tuple()]
+            neigh = join_points[over_name, round(center + off, 0).freeze()]
         except KeyError:
             continue
 
@@ -512,13 +786,12 @@ def fix_single_straight(
         elif seg.start != off_min or seg.end != off_max:
             # The other side is also present. Only override if we are on both
             # sides.
-            if (over_name, ) + (center - off).as_tuple() in join_points:
+            if (over_name, round(center - off, 0).freeze()) in join_points:
                 seg.start = off_min
                 seg.end = off_max
         # Else: Both equal, we're fine.
     if seg.start == seg.end:
         raise ValueError(
-            'Cannot determine orientation '
-            'for 1-wide straight '
-            'antline at ({})!'.format(seg.start)
+            'Cannot determine orientation for 1-wide straight '
+            f'antline "{over_name}" at ({seg.start})!'
         )

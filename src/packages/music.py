@@ -1,31 +1,41 @@
 """Definitions for background music used in the map."""
 from __future__ import annotations
-from collections.abc import Iterable
-from typing import Iterator
+from typing import Final, override
 
-from srctools import Property
+from collections.abc import Awaitable, Callable, Mapping, Iterable, Iterator
+
+from srctools import conv_float
 import srctools.logger
 
-from consts import MusicChannel
+import utils
 from app import lazy_conf
+from consts import MusicChannel
+from packages import (
+    AttrMap, ExportKey, PackagesSet, PackErrorInfo, SelPakObject, ParseData, SelitemData,
+    get_config,
+)
 from transtoken import TransTokenSource
-from packages import PackagesSet, PakObject, ParseData, SelitemData, get_config, ExportData
 
 
 LOGGER = srctools.logger.get_logger(__name__)
 
 
-class Music(PakObject, needs_foreground=True):
+class Music(SelPakObject, needs_foreground=True, style_suggest_key='music'):
     """Allows specifying background music for the map."""
+    type ExportInfo = Mapping[MusicChannel, utils.SpecialID]
+    export_info: Final[ExportKey[ExportInfo]] = ExportKey()
+
     def __init__(
         self,
-        music_id,
+        music_id: str,
         selitem_data: SelitemData,
-        sound: dict[MusicChannel, list[str]],
-        children: dict[MusicChannel, str],
+        sound: Mapping[MusicChannel, list[str]],
+        *,
+        children: Mapping[MusicChannel, str],
+        sample: Mapping[MusicChannel, str],
+        volume: Mapping[MusicChannel, float],
         config: lazy_conf.LazyConf = lazy_conf.BLANK,
         inst: str | None = None,
-        sample: dict[MusicChannel, str | None] = None,
         pack: Iterable[str] = (),
         loop_len: int = 0,
         synch_tbeam: bool = False,
@@ -38,13 +48,15 @@ class Music(PakObject, needs_foreground=True):
         self.packfiles = list(pack)
         self.len = loop_len
         self.sample = sample
+        self.volume = volume
 
         self.selitem_data = selitem_data
 
         self.has_synced_tbeam = synch_tbeam
 
     @classmethod
-    async def parse(cls, data: ParseData):
+    @override
+    async def parse(cls, data: ParseData) -> Music:
         """Parse a music definition."""
         selitem_data = SelitemData.parse(data.info, data.pak_id)
         inst = data.info['instance', None]
@@ -73,7 +85,7 @@ class Music(PakObject, needs_foreground=True):
         # The sample music file to play, if found.
         sample_block = data.info.find_key('sample', '')
         if sample_block.has_children():
-            sample: dict[MusicChannel, str | None] = {}
+            sample: dict[MusicChannel, str] = {}
             for channel in MusicChannel:
                 chan_sample = sample[channel] = sample_block[channel.value, '']
                 if chan_sample:
@@ -91,33 +103,43 @@ class Music(PakObject, needs_foreground=True):
                             zip_sample,
                         )
                 else:
-                    sample[channel] = None
+                    sample[channel] = ''
         else:
             # Single value, fill it into all channels.
-            sample = {
-                channel: sample_block.value
-                for channel in MusicChannel
-            }
+            sample = dict.fromkeys(MusicChannel, sample_block.value)
 
         snd_length_str = data.info['loop_len', '0']
         # Allow specifying lengths as [hour:]min:sec.
         if ':' in snd_length_str:
-            parts = snd_length_str.split(':')
-            if len(parts) == 3:
-                hour, minute, second = parts
-                snd_length = srctools.conv_int(second)
-                snd_length += 60 * srctools.conv_int(minute)
-                snd_length += 60 * 60 * srctools.conv_int(hour)
-            elif len(parts) == 2:
-                minute, second = parts
-                snd_length = 60 * srctools.conv_int(minute) + srctools.conv_int(second)
-            else:
-                raise ValueError(
-                    f'Unknown music duration "{snd_length_str}". '
-                    'Valid durations are "hours:min:sec", "min:sec" or just seconds.'
-                )
+            match snd_length_str.split(':'):
+                case [hour, minute, second]:
+                    snd_length = srctools.conv_int(second)
+                    snd_length += 60 * srctools.conv_int(minute)
+                    snd_length += 60 * 60 * srctools.conv_int(hour)
+                case [minute, second]:
+                    snd_length = 60 * srctools.conv_int(minute) + srctools.conv_int(second)
+                case _:
+                    raise ValueError(
+                        f'Unknown music duration "{snd_length_str}". '
+                        'Valid durations are "hours:min:sec", "min:sec" or just seconds.'
+                    )
         else:
             snd_length = srctools.conv_int(snd_length_str)
+
+        volume_kv = data.info.find_key('volume', '')
+        if volume_kv.has_children():
+            volume: dict[MusicChannel, float] = {}
+            for channel in MusicChannel:
+                volume[channel] = volume_kv.float(channel.value, 1.0)
+        else:
+            # By default, make gel music quieter.
+            conf_volume = conv_float(volume_kv.value, 1.0)
+            volume = {
+                MusicChannel.BASE: conf_volume,
+                MusicChannel.TBEAM: conf_volume,
+                MusicChannel.BOUNCE: 0.5 * conf_volume,
+                MusicChannel.SPEED: 0.5 * conf_volume,
+            }
 
         children_prop = data.info.find_block('children', or_blank=True)
 
@@ -132,13 +154,21 @@ class Music(PakObject, needs_foreground=True):
             },
             inst=inst,
             sample=sample,
-            config=get_config(data.info, 'music', pak_id=data.pak_id, source=f'Music <{data.id}>'),
+            config=await get_config(
+                data.packset,
+                data.info,
+                'music',
+                pak_id=data.pak_id,
+                source=f'Music <{data.id}>',
+            ),
             pack=[prop.value for prop in data.info.find_all('pack')],
             loop_len=snd_length,
             synch_tbeam=synch_tbeam,
+            volume=volume,
         )
 
-    def add_over(self, override: 'Music') -> None:
+    @override
+    def add_over(self, override: Music) -> None:
         """Add the additional vbsp_config commands to ourselves."""
         self.config = lazy_conf.concat(self.config, override.config)
         self.selitem_data += override.selitem_data
@@ -146,18 +176,10 @@ class Music(PakObject, needs_foreground=True):
     def __repr__(self) -> str:
         return f'<Music {self.id}>'
 
+    @override
     def iter_trans_tokens(self) -> Iterator[TransTokenSource]:
         """Yield all translation tokens used by this music."""
         yield from self.selitem_data.iter_trans_tokens('music/' + self.id)
-
-    def provides_channel(self, channel: MusicChannel) -> bool:
-        """Check if this music has this channel."""
-        if self.sound[channel]:
-            return True
-        if channel is MusicChannel.BASE and self.inst:
-            # The instance provides the base track.
-            return True
-        return False
 
     def has_channel(self, packset: PackagesSet, channel: MusicChannel) -> bool:
         """Check if this track or its children has a channel."""
@@ -166,111 +188,42 @@ class Music(PakObject, needs_foreground=True):
         if channel is MusicChannel.BASE and self.inst:
             # The instance provides the base track.
             return True
+        if not (child_id := self.children[channel]):
+            return False
         try:
-            children = packset.obj_by_id(Music, self.children[channel])
+            children = packset.obj_by_id(Music, child_id)
         except KeyError:
             return False
         return bool(children.sound[channel])
 
-    def get_attrs(self, packset: PackagesSet) -> dict[str, bool]:
-        """Generate attributes for SelectorWin."""
-        attrs = {
-            channel.name: self.has_channel(packset, channel)
-            for channel in MusicChannel
-            if channel is not MusicChannel.BASE
-        }
-        attrs['TBEAM_SYNC'] = self.has_synced_tbeam
-        return attrs
-
-    def get_suggestion(self, channel: MusicChannel) -> str | None:
+    def get_suggestion(self, packset: PackagesSet, channel: MusicChannel) -> utils.SpecialID:
         """Get the ID we want to suggest for a channel."""
-        try:
-            child = Music.by_id(self.children[channel])
-        except KeyError:
-            child = self
+        child = self
+        if self.children[channel]:
+            try:
+                child = packset.obj_by_id(Music, self.children[channel])
+            except KeyError:
+                pass
         if child.sound[channel]:
-            return child.id
-        return None
-
-    def get_sample(self, channel: MusicChannel) -> str | None:
-        """Get the path to the sample file, if present."""
-        if self.sample[channel]:
-            return self.sample[channel]
-        try:
-            children = Music.by_id(self.children[channel])
-        except KeyError:
-            return None
-        return children.sample[channel]
-
-    @staticmethod
-    def export(exp_data: ExportData):
-        """Export the selected music."""
-        selected: dict[MusicChannel, Music | None] = exp_data.selected
-
-        base_music = selected[MusicChannel.BASE]
-
-        vbsp_config = exp_data.vbsp_conf
-
-        if base_music is not None:
-            vbsp_config += base_music.config()
-
-        music_conf = Property('MusicScript', [])
-        vbsp_config.append(music_conf)
-        to_pack = set()
-
-        for channel, music in selected.items():
-            if music is None:
-                continue
-
-            sounds = music.sound[channel]
-            if len(sounds) == 1:
-                music_conf.append(Property(channel.value, sounds[0]))
-            else:
-                music_conf.append(Property(channel.value, [
-                    Property('snd', snd)
-                    for snd in sounds
-                ]))
-
-            to_pack.update(music.packfiles)
-
-        # If we need to pack, add the files to be unconditionally
-        # packed.
-        if to_pack:
-            music_conf.append(Property('pack', [
-                Property('file', filename)
-                for filename in to_pack
-            ]))
-
-        if base_music is not None:
-            vbsp_config.set_key(
-                ('Options', 'music_looplen'),
-                str(base_music.len),
-            )
-
-            vbsp_config.set_key(
-                ('Options', 'music_sync_tbeam'),
-                srctools.bool_as_int(base_music.has_synced_tbeam),
-            )
-            vbsp_config.set_key(
-                ('Options', 'music_instance'),
-                base_music.inst or '',
-            )
+            return utils.obj_id(child.id)
+        return utils.ID_NONE
 
     @classmethod
-    async def post_parse(cls, packset: PackagesSet) -> None:
+    @override
+    async def post_parse(cls, ctx: PackErrorInfo) -> None:
         """Check children of each music item actually exist.
 
         This must be done after they all were parsed.
         """
         sounds: dict[frozenset[str], str] = {}
 
-        for music in packset.all_obj(cls):
+        for music in ctx.packset.all_obj(cls):
             for channel in MusicChannel:
                 # Base isn't present in this.
                 child_id = music.children.get(channel, '')
                 if child_id:
                     try:
-                        packset.obj_by_id(cls, child_id)
+                        ctx.packset.obj_by_id(cls, child_id)
                     except KeyError:
                         LOGGER.warning(
                             'Music "{}" refers to nonexistent'
@@ -281,7 +234,7 @@ class Music(PakObject, needs_foreground=True):
                         )
                 # Look for tracks used in two items, indicates
                 # they should be children of one...
-                soundset = frozenset(map(str.casefold, music.sound[channel]))
+                soundset = frozenset({snd.casefold() for snd in music.sound[channel]})
                 if not soundset:
                     continue  # Blank shouldn't match blanks...
 
@@ -297,3 +250,76 @@ class Music(PakObject, needs_foreground=True):
                             other_id,
                             sorted(soundset)
                         )
+
+    @classmethod
+    def music_for_channel(cls, channel: MusicChannel) -> Callable[[PackagesSet], Awaitable[list[utils.SpecialID]]]:
+        """Return a callable which lists all music with the specified channel."""
+        async def get_channels(packset: PackagesSet) -> list[utils.SpecialID]:
+            """Return music with this channel."""
+            await packset.ready(cls).wait()
+            ids = [utils.ID_NONE]
+            for music in packset.all_obj(cls):
+                if music.sound[channel]:
+                    ids.append(utils.obj_id(music.id))
+                elif channel is MusicChannel.BASE and music.inst:
+                    # The instance provides the base track.
+                    ids.append(utils.obj_id(music.id))
+            return ids
+        return get_channels
+
+    @classmethod
+    def get_base_selector_attrs(cls, packset: PackagesSet, music_id: utils.SpecialID) -> AttrMap:
+        """Indicates what sub-tracks are available."""
+        if utils.not_special_id(music_id):
+            try:
+                music = packset.obj_by_id(cls, music_id)
+            except KeyError:
+                LOGGER.warning('No music track with ID "{}"!', music_id)
+                return {}
+            attrs = {
+                channel.name: music.has_channel(packset, channel)
+                for channel in MusicChannel
+                if channel is not MusicChannel.BASE
+            }
+            attrs['TBEAM_SYNC'] = music.has_synced_tbeam
+            return attrs
+        else:
+            # None, no channels.
+            return {}
+
+    @classmethod
+    def get_funnel_selector_attrs(cls, packset: PackagesSet, music_id: utils.SpecialID) -> AttrMap:
+        """Indicate whether the funnel is synced."""
+        if utils.not_special_id(music_id):
+            try:
+                music = packset.obj_by_id(cls, music_id)
+            except KeyError:
+                return {}
+            return {
+                'TBEAM_SYNC': music.has_synced_tbeam,
+            }
+        else:
+            # No music is not synced.
+            return {'TBEAM_SYNC': False}
+
+    @classmethod
+    def sample_getter_func(cls, channel: MusicChannel) -> Callable[[PackagesSet, utils.SpecialID], str]:
+        """Return a function which retrieves the sample sound for the specified channel."""
+        def sample_getter(packset: PackagesSet, music_id: utils.SpecialID) -> str:
+            """Fetch the sample."""
+            if utils.not_special_id(music_id):
+                try:
+                    music = packset.obj_by_id(cls, music_id)
+                except KeyError:
+                    return ''
+                if music.sample[channel]:
+                    return music.sample[channel]
+                try:
+                    children = packset.obj_by_id(cls, music.children[channel])
+                except KeyError:
+                    return ''
+                return children.sample[channel]
+            else:
+                # No music, no sample.
+                return ''
+        return sample_getter

@@ -1,48 +1,35 @@
 """A widget for picking from a specific list of options."""
-from typing import Tuple, List, Dict
-from tkinter import ttk
 import tkinter as tk
 
+from trio_util import AsyncValue
 import srctools.logger
-from srctools import Property
+import trio
 
-from app.itemconfig import UpdateFunc, WidgetLookup
+from packages.widgets import DropdownOptions
+from app import itemconfig
+from ui_tk import tk_tools
+from ui_tk.img import TKImages
 
 
 LOGGER = srctools.logger.get_logger(__name__)
 
 
-@WidgetLookup('dropdown')
-async def dropdown(parent: tk.Widget, var: tk.StringVar, conf: Property) -> Tuple[tk.Widget, UpdateFunc]:
+@itemconfig.TK_IMPL.register_ui_single_wconf(DropdownOptions)
+async def dropdown(
+    parent: tk.Widget, tk_img: TKImages,
+    holder: AsyncValue[str],
+    conf: DropdownOptions,
+    /, *, task_status: trio.TaskStatus[tk.Widget] = trio.TASK_STATUS_IGNORED,
+) -> None:
     """Dropdowns allow selecting from a few options."""
-    options: List[str] = []
-    display: List[str] = []
-    key_to_index: Dict[str, int] = {}
 
-    for ind, prop in enumerate(conf.find_children('Options')):
-        options.append(prop.real_name)
-        display.append(prop.value)
-        key_to_index[prop.name] = ind
-
-    async def update_ui(new_value: str) -> None:
-        """Update when new values are picked."""
-        try:
-            index = key_to_index[new_value.casefold()]
-        except KeyError:
-            LOGGER.warning('Invalid combobox value: "{}"!', new_value)
-            return
-        combobox.current(index)
-
-    def on_changed(_: tk.Event) -> None:
-        """Called when the combobox changes."""
-        var.set(options[combobox.current()])
-
-    combobox = ttk.Combobox(
+    combobox = tk_tools.ComboBoxMap(
         parent,
-        exportselection=False,
-        state='readonly',
-        values=display,
+        name='',  # Auto-generate.
+        current=holder,
+        values=conf.options,
     )
-    combobox.bind('<<ComboboxSelected>>', on_changed)
-    await update_ui(var.get())
-    return combobox, update_ui
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(combobox.task)
+        task_status.started(combobox.widget)

@@ -1,33 +1,33 @@
 """Implements fizzler/laserfield generation and customisation."""
 from __future__ import annotations
+
+from typing import Self, final, assert_never
+
+from collections.abc import Callable, Iterator, Sequence
 from collections import defaultdict
-from typing import Iterator, Callable
 from enum import Enum
 import itertools
+import math
 
 import attrs
 import srctools.vmf
 from srctools.vmf import VMF, Solid, Entity, Side, Output
-from srctools import Property, NoKeyError, Vec, Matrix, Angle, logger
+from srctools import FrozenVec, Keyvalues, NoKeyError, Vec, Matrix, Angle, logger
 
 import utils
 from precomp import (
-    instance_traits, tiling, instanceLocs,
-    texturing,
-    connections,
-    options,
-    packing,
-    template_brush,
-    conditions, rand,
+    instance_traits, tiling, instanceLocs, texturing, connections,
+    options, packing, template_brush, brushLoc, conditions, rand,
 )
 import consts
 import user_errors
+from precomp.collisions import Collisions
 
 
-COND_MOD_NAME = None
+COND_MOD_NAME: str | None = None
 LOGGER = logger.get_logger(__name__)
 
-FIZZ_TYPES: dict[str, FizzlerType] = {}
+FIZZ_TYPES: dict[utils.ObjectID, FizzlerType] = {}
 FIZZLERS: dict[str, Fizzler] = {}
 
 # Fizzler textures are higher-res than laserfields.
@@ -42,26 +42,6 @@ MATMOD_OFFSETS = [
     Vec(0, -16, -64),
     Vec(0,   0,  32),
 ]
-
-
-class TexGroup(Enum):
-    """Types of textures used for fizzlers."""
-    # These set for fizzlers.
-    LEFT = 'left'
-    RIGHT = 'right'
-    CENTER = 'center'
-    SHORT = 'short'  # 128 field
-
-    # Other types:
-    FITTED = 'fitted'  # If set, use this for all - scaled like laserfields do.
-    # If set, it's an invisible trigger/clip - just apply this to all sides.
-    TRIGGER = 'trigger'
-
-    # Special case - for Tag fizzlers, when it's on for that side.
-    TAG_ON_LEFT = 'tag_left'
-    TAG_ON_RIGHT = 'tag_right'
-    TAG_ON_CENTER = 'tag_center'
-    TAG_ON_SHORT = 'tag_short'
 
 
 class ModelName(Enum):
@@ -87,6 +67,7 @@ class FizzInst(Enum):
     BASE = 'base_inst'  # If set, swap the instance to this.
 
 
+@final
 @attrs.frozen
 class MatModify:
     """Data for injected material modify controls."""
@@ -94,16 +75,64 @@ class MatModify:
     mat_var: str
 
 
+@final
 @attrs.frozen
 class FizzBeam:
     """Configuration for env_beams added across fizzlers."""
     offset: list[Vec]
-    keys: Property
+    keys: Keyvalues
     speed_min: int
     speed_max: int
 
 
-def read_configs(conf: Property) -> None:
+@final
+@attrs.frozen
+class FizzTexture:
+    """The set of textures for a fizzler."""
+    left: str
+    right: str
+    center: str
+    short: str | None  # 128 field
+
+    @classmethod
+    def parse(cls, kv: Keyvalues, prefix: str) -> FizzTexture:
+        """Parse from keyvalues."""
+        return cls(
+            kv[f'{prefix}_left'],
+            kv[f'{prefix}_right'],
+            kv[f'{prefix}_center'],
+            kv[f'{prefix}_short', None],
+        )
+
+
+@attrs.frozen(kw_only=True)
+class Textures:
+    """Textures that can be used."""
+    # Either a FizzTexture, or one used for the whole surface.
+    primary: str | FizzTexture
+
+    # Only relevant if non-fizzler
+    # If set, fit the texture like a laserfield.
+    # Otherwise, it's a trigger/clip, apply to all sides.
+    is_fitted: bool = False
+
+    # If set, overrides material used for the invisible 1/4 section to the top of goo.
+    goo: str | None = None
+
+    # Special case - for Tag fizzlers, when it's on for that side.
+    tag_on: FizzTexture | None = None
+
+    def __attrs_post_init__(self) -> None:
+        """Both short mats must match."""
+        if isinstance(self.primary, FizzTexture) and self.tag_on is not None:
+            assert (self.primary.short is None) is (self.tag_on.short is None), self
+
+    @property
+    def is_trigger(self) -> bool:
+        return not self.is_fitted
+
+
+def read_configs(conf: Keyvalues) -> None:
     """Read in the fizzler data."""
     for fizz_conf in conf.find_all('Fizzlers', 'Fizzler'):
         with logger.context(fizz_conf['id', '??']):
@@ -116,7 +145,7 @@ def read_configs(conf: Property) -> None:
 
     LOGGER.info('Loaded {} fizzlers.', len(FIZZ_TYPES))
 
-    if options.get(str, 'game_id') != utils.STEAM_IDS['APTAG']:
+    if options.GAME_ID() != utils.STEAM_IDS['APTAG']:
         return
     # In Aperture Tag, we don't have portals. For fizzler types which block
     # portals (trigger_portal_cleanser), additionally fizzle paint.
@@ -142,9 +171,7 @@ def read_configs(conf: Property) -> None:
         # Add a paint fizzler brush to these fizzlers.
         fizz.brushes.append(FizzlerBrush(
             brush_name,
-            textures={
-                TexGroup.TRIGGER: consts.Tools.TRIGGER,
-            },
+            textures=Textures(primary=consts.Tools.TRIGGER, is_fitted=False),
             keys={
                 'classname': 'trigger_paint_cleanser',
                 'startdisabled': brush_start_disabled or '0',
@@ -153,80 +180,70 @@ def read_configs(conf: Property) -> None:
             local_keys={},
             outputs=[],
             singular=True,
+            goo_extend=True,
         ))
 
 
+@final
+@attrs.define(eq=False, kw_only=True)
 class FizzlerType:
     """Implements a specific fizzler type."""
-    def __init__(
-        self,
-        fizz_id: str,
-        item_ids: list[str],
-        voice_attrs: list[str],
-        pack_lists: set[str],
-        pack_lists_static: set[str],
-        model_local_name: str,
-        model_name_type: ModelName,
-        nodraw_behind: bool,
-        brushes: list[FizzlerBrush],
-        beams: list[FizzBeam],
-        inst: dict[tuple[FizzInst, bool], list[str]],
+    # Name for the item.
+    id: utils.ObjectID
 
-        temp_brush_keys: Property,
-        temp_min: str | None,
-        temp_max: str | None,
-        temp_single: str | None,
-    ):
-        self.id = fizz_id
+    # The item ID(s) this fizzler is produced from, optionally
+    # with a :laserfield or :fizzler suffix to choose a specific
+    # type.
+    item_ids: list[str]
 
-        # The item ID(s) this fizzler is produced from, optionally
-        # with a :laserfield or :fizzler suffix to choose a specific
-        # type.
-        self.item_ids = item_ids
+    # The brushes to generate.
+    brushes: list[FizzlerBrush]
 
-        # The brushes to generate.
-        self.brushes = brushes
+    # Beams to generate.
+    beams: list[FizzBeam]
 
-        # Beams to generate.
-        self.beams = beams
+    voice_attrs: list[str]
 
-        self.voice_attrs = voice_attrs
+    # Packfiles to pack if we're in the map.
+    pack_lists: set[str]
+    pack_lists_static: set[str]
 
-        # Packfiles to pack if we're in the map.
-        self.pack_lists = pack_lists
-        self.pack_lists_static = pack_lists_static
+    # The method used to name the models.
+    model_naming: ModelName
+    model_name: str
 
-        # The method used to name the models.
-        self.model_naming = model_name_type
-        self.model_name = model_local_name
-        # Instances to use - FizzInst, is_static -> list of instances.
-        self.inst = inst
+    # Instances to use - FizzInst, is_static -> list of instances.
+    inst: dict[tuple[FizzInst, bool], list[str]]
 
-        # If set, nodraw the 128x32 area behind the fizzler - to allow
-        # the Clean model to stick through.
-        self.nodraw_behind = nodraw_behind
+    # If set, nodraw the 128x32 area behind the fizzler - to allow
+    # the Clean model to stick through.
+    nodraw_behind: bool
 
-        # If set, add a brush ent using templates.
-        self.temp_single = temp_single
-        self.temp_max = temp_max
-        self.temp_min = temp_min
-        self.temp_brush_keys = temp_brush_keys
+    # If set, add a brush ent using templates.
+    temp_brush_keys: Keyvalues | None
+    temp_single: Sequence[str]
+    temp_max: Sequence[str]
+    temp_min: Sequence[str]
 
+    blocks_portals: bool = attrs.field(init=False, default=False)
+    fizzles_portals: bool = attrs.field(init=False, default=False)
+
+    def __attrs_post_init__(self) -> None:
         self.blocks_portals = False
         self.fizzles_portals = False
         # We want to know which fizzlers block or fizzle portals.
-        for br in brushes:
+        for br in self.brushes:
             if br.keys['classname'].casefold() == 'trigger_portal_cleanser':
                 # Fizzlers always block.
                 self.blocks_portals = True
                 if srctools.conv_int(br.keys.get('spawnflags', 0)) & 1:
                     self.fizzles_portals = True
-        LOGGER.debug('{}: blocks={}, fizzles={}', fizz_id, self.blocks_portals, self.fizzles_portals)
+        LOGGER.debug('{}: blocks={}, fizzles={}', self.id, self.blocks_portals, self.fizzles_portals)
 
     @classmethod
-    def parse(cls, conf: Property):
+    def parse(cls, conf: Keyvalues) -> Self:
         """Read in a fizzler from a config."""
-        fizz_id = conf['id']
+        fizz_id = utils.obj_id(conf['id'])
         item_ids = [
             prop.value.upper()
             for prop in
@@ -249,14 +266,30 @@ class FizzlerType:
             inst_type_name = inst_type.value + ('_static' if is_static else '')
             instances: list[str] = []
             inst[inst_type, is_static] = instances
-            for prop in conf.find_all(inst_type_name):
+            kvs = conf.find_all(inst_type_name)
+            if '_' in inst_type_name:
+                # Allow ModelLeft as well as model_left.
+                kvs = itertools.chain(kvs, conf.find_all(inst_type_name.replace('_', '')))
+            for prop in kvs:
+                if not prop.value:  # Explicitly empty, add that to the list.
+                    instances.append('')
+                    continue
                 resolved = instanceLocs.resolve(prop.value)
-                if prop.value and not resolved:
+                found = False
+                for inst_name in resolved:
+                    # Skip blank instances, if done via lookup.
+                    if inst_name:
+                        instances.append(inst_name)
+                        found = True
+                if prop.value and not found:
                     LOGGER.warning('No instances found using specifier "{}"!', prop.value)
-                instances.extend(resolved)
 
             # Allow specifying weights to bias model locations
             weights = conf[inst_type_name + '_weight', '']
+            if not weights:
+                # Allow ModelLeftWeight as an alternative.
+                weights = conf[inst_type_name.replace('_', '') + 'weight', '']
+
             if weights:
                 # Produce the weights, then process through the original
                 # list to build a new one with repeated elements.
@@ -267,7 +300,7 @@ class FizzlerType:
             # If static versions aren't given, reuse non-static ones.
             # We did False before True above, so we know it's already been calculated.
             if not instances and is_static:
-                inst[inst_type, True] = inst[inst_type, False]
+                inst[inst_type, True] = inst[inst_type, False].copy()
 
         voice_attrs = []
         for prop in conf.find_all('Has'):
@@ -303,7 +336,7 @@ class FizzlerType:
                 for off in
                 beam_prop.find_all('pos')
             ]
-            keys = Property('', [
+            keys = Keyvalues('', [
                 beam_prop.find_key('Keys', or_blank=True),
                 beam_prop.find_key('LocalKeys', or_blank=True)
             ])
@@ -314,62 +347,62 @@ class FizzlerType:
                 beam_prop.int('RandSpeedMax', 0),
             ))
 
+        temp_min: Sequence[str]
+        temp_max: Sequence[str]
+        temp_single: Sequence[str]
         try:
             temp_conf = conf.find_key('TemplateBrush')
         except NoKeyError:
-            temp_brush_keys = temp_min = temp_max = temp_single = None
+            temp_brush_keys = None
+            temp_min = temp_max = temp_single = ()
         else:
-            temp_brush_keys = Property('--', [
-                temp_conf.find_key('Keys'),
+            temp_brush_keys = Keyvalues.root(
+                temp_conf.find_key('Keys', or_blank=True),
                 temp_conf.find_key('LocalKeys', or_blank=True),
-            ])
+            )
 
-            # Find and load the templates.
-            temp_min = temp_conf['Left', None]
-            temp_max = temp_conf['Right', None]
-            temp_single = temp_conf['Single', None]
+            temp_min = temp_conf.find_key('Left', or_blank=True).as_array()
+            temp_max = temp_conf.find_key('Right', or_blank=True).as_array()
+            temp_single = temp_conf.find_key('Single', or_blank=True).as_array()
 
         return FizzlerType(
-            fizz_id,
-            item_ids,
-            voice_attrs,
-            pack_lists,
-            pack_lists_static,
-            model_local_name,
-            model_name_type,
-            conf.bool('nodraw_behind'),
-            brushes,
-            beams,
-            inst,
-            temp_brush_keys,
-            temp_min,
-            temp_max,
-            temp_single,
+            id=fizz_id,
+            item_ids=item_ids,
+            voice_attrs=voice_attrs,
+            pack_lists=pack_lists,
+            pack_lists_static=pack_lists_static,
+            model_name=model_local_name,
+            model_naming=model_name_type,
+            nodraw_behind=conf.bool('nodraw_behind'),
+            brushes=brushes,
+            beams=beams,
+            inst=inst,
+            temp_brush_keys=temp_brush_keys,
+            temp_min=temp_min,
+            temp_max=temp_max,
+            temp_single=temp_single,
         )
 
 
+@final
+@attrs.define(eq=False, kw_only=True)
 class Fizzler:
     """Represents a specific pair of emitters and a field."""
-    def __init__(
-        self,
-        fizz_type: FizzlerType,
-        up_axis: Vec,
-        base_inst: Entity,
-        emitters: list[tuple[Vec, Vec]]
-    ) -> None:
-        self.fizz_type = fizz_type
-        self.base_inst = base_inst
-        self.up_axis = up_axis  # Pointing toward the 'up' side of the field.
-        self.emitters = emitters  # Pairs of left, right positions.
+    fizz_type: FizzlerType
+    base_inst: Entity
+    up_axis: Vec  # Pointing toward the 'up' side of the field.
+    emitters: list[tuple[Vec, Vec]]  # Pairs of left, right positions.
 
-        self.has_cust_position = False  # If the emitters are a custom layout
-        # True if the fizzler is in the original position, and so we need
-        # to adjust tiles for the sides.
-        self.embedded = True
+    # If the emitters are a custom layout
+    has_cust_position: bool = False
+    # True if the fizzler is in the original position, and so we need
+    # to adjust tiles for the sides.
+    embedded: bool = True
 
-        # Special case - for TAG fizzlers, if that side is enabled.
-        # We generate the triggers elsewhere.
-        self.tag_on_pos = self.tag_on_neg = False
+    # Special case - for TAG fizzlers, if that side is enabled.
+    # We generate the triggers elsewhere.
+    tag_on_pos: bool = False
+    tag_on_neg: bool = False
 
     def forward(self) -> Vec:
         """The axis moving from one side to another."""
@@ -398,7 +431,6 @@ class Fizzler:
 
         # Make global entities if not present.
         if '_fizz_flinch_hurt' not in vmf.by_target:
-            glob_ent_loc = options.get(Vec, 'global_ents_loc')
             vmf.create_ent(
                 classname='point_hurt',
                 targetname='_fizz_flinch_hurt',
@@ -407,7 +439,7 @@ class Fizzler:
                 DamageType=8 | 1024 | 2048,
                 DamageTarget='!activator',  # Hurt the triggering player.
                 DamageRadius=1,  # Target makes this unused.
-                origin=glob_ent_loc,
+                origin=options.GLOBAL_ENTS_LOC(),
             )
 
         # We need two catapults - one for each side.
@@ -583,9 +615,9 @@ class Fizzler:
         if not border or (not tiledefs_up and not tiledefs_dn):
             return
 
-        overlay_thickness = options.get(int, 'fizz_border_thickness')
-        overlay_repeat = options.get(int, 'fizz_border_repeat')
-        flip_uv = options.get(bool, 'fizz_border_vertical')
+        overlay_thickness = options.FIZZ_BORDER_THICKNESS()
+        overlay_repeat = options.FIZZ_BORDER_REPEAT()
+        flip_uv = options.FIZZ_BORDER_VERTICAL()
 
         if flip_uv:
             u_rep = 1.0
@@ -603,12 +635,13 @@ class Fizzler:
                 origin=cent_pos + 64 * up,
                 uax=forward * overlay_len,
                 vax=Vec.cross(up, forward) * overlay_thickness,
-                material=texturing.SPECIAL.get(cent_pos + 64 * up, 'fizz_border'),
+                material='',
                 surfaces=[],
                 u_repeat=u_rep,
                 v_repeat=v_rep,
                 swap=flip_uv,
             )
+            texturing.SPECIAL.get(cent_pos + 64 * up, 'fizz_border').apply_over(over)
             for tile in tiledefs_up:
                 tile.bind_overlay(over)
 
@@ -619,12 +652,13 @@ class Fizzler:
                 origin=cent_pos - 64 * up,
                 uax=forward * overlay_len,
                 vax=Vec.cross(-up, forward) * overlay_thickness,
-                material=texturing.SPECIAL.get(cent_pos - 64 * up, 'fizz_border'),
+                material='',
                 surfaces=[],
                 u_repeat=u_rep,
                 v_repeat=v_rep,
                 swap=flip_uv,
             )
+            texturing.SPECIAL.get(cent_pos - 64 * up, 'fizz_border').apply_over(over)
             for tile in tiledefs_dn:
                 tile.bind_overlay(over)
 
@@ -634,22 +668,24 @@ class FizzlerBrush:
     def __init__(
         self,
         name: str,
-        textures: dict[TexGroup, str | None],
+        textures: Textures,
         keys: dict[str, str],
         local_keys: dict[str, str],
         outputs: list[Output],
-        thickness: float=2.0,
-        stretch_center: bool=True,
-        side_color: Vec=None,
-        singular: bool=False,
-        set_axis_var: bool=False,
-        mat_mod_name: str=None,
-        mat_mod_var: str=None,
+        thickness: float = 2.0,
+        stretch_center: bool = True,
+        side_color: Vec | None = None,
+        singular: bool = False,
+        set_axis_var: bool = False,
+        goo_extend: bool = False,
+        mat_mod_name: str | None = None,
+        mat_mod_var: str | None = None,
     ) -> None:
         self.keys = keys
         self.local_keys = local_keys
         self.name = name  # Local name of the fizzler brush.
         self.outputs = list(outputs)
+        self.textures = textures
         # Width of the brush.
         self.thickness = thickness
         # If set, a colour to apply to the sides.
@@ -661,12 +697,17 @@ class FizzlerBrush:
         # If set, stretch the center to the brush size.
         self.stretch_center = stretch_center
 
+        # If set, this is allowed to extend into the goo underneath the fizzler.
+        # If a custom texture is provided, force this on.
+        self.goo_extend = textures.goo is not None or goo_extend
+
         # If set, store a 'axis' variable in VScript to the plane.
         self.set_axis_var = set_axis_var
 
         # If set, add a material_modify_control to control these brushes.
-        if mat_mod_var is not None and not mat_mod_var.startswith('$'):
-            mat_mod_var = '$' + mat_mod_var
+        if mat_mod_var is not None:
+            if not mat_mod_var.startswith('$'):
+                mat_mod_var = f'${mat_mod_var}'
             if mat_mod_name is None:
                 mat_mod_name = 'mat_mod'
             if not singular:
@@ -676,12 +717,8 @@ class FizzlerBrush:
         self.mat_mod_var = mat_mod_var
         self.mat_mod_name = mat_mod_name
 
-        self.textures: dict[TexGroup, str | None] = {}
-        for group in TexGroup:
-            self.textures[group] = textures.get(group, None)
-
     @classmethod
-    def parse(cls, conf: Property, fizz_id: str) -> FizzlerBrush:
+    def parse(cls, conf: Keyvalues, fizz_id: utils.ObjectID) -> FizzlerBrush:
         """Parse from a config file."""
         if 'side_color' in conf:
             side_color = conf.vec('side_color')
@@ -694,9 +731,36 @@ class FizzlerBrush:
             conf.find_children('Outputs')
         ]
 
-        textures: dict[TexGroup, str | None] = {}
-        for group in TexGroup:
-            textures[group] = conf['tex_' + group.value, None]
+        if 'tex_trigger' in conf:
+            textures = Textures(primary=conf['tex_trigger'], is_fitted=False)
+        elif 'tex_fitted' in conf:
+            textures = Textures(primary=conf['tex_fitted'], is_fitted=True)
+        else:
+            try:
+                tex_fiz = FizzTexture.parse(conf, 'tex')
+            except LookupError as exc:
+                raise LookupError(
+                    f'No textures defined for fizzler {fizz_id} - '
+                    f'must define "tex_fitted", "tex_trigger", or all of "tex_left"/"_right"/"_center"!'
+                ) from exc
+            if 'tex_tag_left' in conf or 'tex_tag_right' in conf or 'tex_tag_center' in conf:
+                try:
+                    tex_tag = FizzTexture.parse(conf, 'tex_tag')
+                    if (tex_tag.short is None) is not (tex_fiz.short is None):
+                        raise LookupError('Short definition mismatch.')
+                except LookupError as exc:
+                    raise LookupError(
+                        f'Fizzler {fizz_id} defined partial Aperture Tag on-fizzler definition! '
+                        'If specified, all "tex_tag_left"/"_right"/"_center" must be defined, '
+                        'plus "_short" if the original does.'
+                    ) from exc
+            else:
+                tex_tag = None
+            textures = Textures(primary=tex_fiz, tag_on=tex_tag)
+        try:
+            textures = attrs.evolve(textures, goo=conf['tex_goo'])
+        except LookupError:
+            pass  # No goo material
 
         keys = {
             prop.name: prop.value
@@ -723,10 +787,11 @@ class FizzlerBrush:
             keys=keys,
             local_keys=local_keys,
             outputs=outputs,
-            thickness=conf.float('thickness', 2.0),
+            thickness=max(1/256, conf.float('thickness', 2.0)),
             stretch_center=conf.bool('stretch_center', True),
             side_color=side_color,
             singular=conf.bool('singular'),
+            goo_extend=conf.bool('goo_extend'),
             mat_mod_name=conf['mat_mod_name', None],
             mat_mod_var=conf['mat_mod_var', None],
             set_axis_var=conf.bool('set_axis_var'),
@@ -749,10 +814,11 @@ class FizzlerBrush:
             return
 
         # Produce a hex colour string, and use that as the material name.
-        side.mat = 'bee2/fizz_sides/side_color_{:02X}{:02X}{:02X}'.format(
-            round(self.side_color.x * 255),
-            round(self.side_color.y * 255),
-            round(self.side_color.z * 255),
+        side.mat = (
+            f'bee2/fizz_sides/side_color_'
+            f'{round(self.side_color.x * 255):02X}'
+            f'{round(self.side_color.y * 255):02X}'
+            f'{round(self.side_color.z * 255):02X}'
         )
         used_tex_func(side.mat)
 
@@ -786,20 +852,18 @@ class FizzlerBrush:
 
         origin = (pos + neg)/2
 
-        # If either of these, we only need 1 brush.
-        trigger_tex = self.textures[TexGroup.TRIGGER]
-        fitted_tex = self.textures[TexGroup.FITTED]
-        # If we don't have this, we can't be a single brush.
-        short_tex = self.textures[TexGroup.SHORT]
+        tex_primary = self.textures.primary
 
-        if trigger_tex or fitted_tex:
-            tex_size = LASER_TEX_SIZE
-        else:
-            # Fizzlers are larger resolution..
+        if isinstance(tex_primary, FizzTexture):
+            # Fizzlers are larger resolution.
             tex_size = FIZZLER_TEX_SIZE
+        else:
+            tex_size = LASER_TEX_SIZE
 
         # Treat 127.9999 as 128, etc.
-        if (round(field_length) == 128 and short_tex) or trigger_tex or fitted_tex:
+        if isinstance(tex_primary, str) or (
+            round(field_length) == 128 and tex_primary.short is not None
+        ):
             # We need only one brush.
             brush = vmf.make_prism((
                 origin
@@ -812,11 +876,18 @@ class FizzlerBrush:
                 - (field_length / 2) * field_axis
             )).solid
             yield brush
-            if trigger_tex:
+            if isinstance(tex_primary, str) and self.textures.is_trigger:
                 for side in brush.sides:
-                    side.mat = trigger_tex
-                used_tex_func(trigger_tex)
+                    side.mat = tex_primary
+                used_tex_func(tex_primary)
             else:
+                if isinstance(tex_primary, FizzTexture):
+                    tex_short_off = tex_primary.short
+                    tex_short_on = (self.textures.tag_on or tex_primary).short
+                    assert tex_short_off is not None, self.textures
+                    assert tex_short_on is not None, self.textures
+                else:
+                    tex_short_on = tex_short_off = tex_primary
                 for side in brush.sides:
                     side_norm = side.normal()
 
@@ -826,13 +897,11 @@ class FizzlerBrush:
                     if abs(side_norm) != normal:
                         continue
 
-                    side.mat = fitted_tex or self.textures[
-                        TexGroup.TAG_ON_SHORT if (
-                            fizz.tag_on_pos
-                            if normal.dot(side_norm) > 0 else
-                            fizz.tag_on_neg
-                        ) else TexGroup.SHORT
-                    ]
+                    side.mat = tex_short_on if (
+                        fizz.tag_on_pos
+                        if normal.dot(side_norm) > 0 else
+                        fizz.tag_on_neg
+                    ) else tex_short_off
                     used_tex_func(side.mat)
 
                     self._texture_fit(
@@ -841,8 +910,7 @@ class FizzlerBrush:
                         field_length,
                         fizz,
                         neg,
-                        pos,
-                        bool(fitted_tex),
+                        self.textures.is_fitted,
                     )
 
                     if not self.stretch_center:
@@ -902,7 +970,6 @@ class FizzlerBrush:
                     (brush_center, None, center_len),
                     (brush_right, -field_axis, 64.0),
                 ]
-                used_tex_func(self.textures[TexGroup.CENTER])
             else:
                 brushes = [
                     (brush_left, field_axis, side_len),
@@ -918,11 +985,11 @@ class FizzlerBrush:
                     if abs(side_norm) != abs(normal):
                         continue
 
-                    tag_enabled = (
+                    tex_chosen = (self.textures.tag_on or tex_primary) if (
                         fizz.tag_on_pos
                         if normal.dot(side_norm) > 0 else
                         fizz.tag_on_neg
-                    )
+                    ) else tex_primary
 
                     self._texture_fit(
                         side,
@@ -930,16 +997,11 @@ class FizzlerBrush:
                         brush_length,
                         fizz,
                         neg,
-                        pos,
                     )
 
                     if model_normal is None:
                         # Center textures.
-                        side.mat = self.textures[
-                            TexGroup.TAG_ON_CENTER
-                            if tag_enabled else
-                            TexGroup.CENTER
-                        ]
+                        side.mat = tex_chosen.center
                         if not self.stretch_center:
                             side.uaxis.scale = 0.25
                     else:
@@ -947,17 +1009,9 @@ class FizzlerBrush:
                         # direction the texture should be in. The uaxis is
                         # in the direction of the surface.
                         if side.uaxis.vec() == model_normal:
-                            side.mat = self.textures[
-                                TexGroup.TAG_ON_RIGHT
-                                if tag_enabled else
-                                TexGroup.RIGHT
-                            ]
+                            side.mat = tex_chosen.right
                         else:
-                            side.mat = self.textures[
-                                TexGroup.TAG_ON_LEFT
-                                if tag_enabled else
-                                TexGroup.LEFT
-                            ]
+                            side.mat = tex_chosen.left
                     used_tex_func(side.mat)
 
     def _texture_fit(
@@ -967,7 +1021,6 @@ class FizzlerBrush:
         field_length: float,
         fizz: Fizzler,
         neg: Vec,
-        pos: Vec,
         is_laserfield: bool = False,
     ) -> None:
         """Calculate the texture offsets required for fitting a texture."""
@@ -989,6 +1042,64 @@ class FizzlerBrush:
         side.uaxis.offset %= tex_size
         side.vaxis.offset %= tex_size
 
+    def generate_ent(self, vmf: VMF, fizz: Fizzler, center: Vec) -> Entity:
+        """Create an entity for this brush type."""
+        brush_ent = vmf.create_ent(classname='func_brush')
+        for key_name, key_value in self.keys.items():
+            brush_ent[key_name] = fizz.base_inst.fixup.substitute(key_value, allow_invert=True)
+        for key_name, key_value in self.local_keys.items():
+            brush_ent[key_name] = conditions.local_name(
+                fizz.base_inst,
+                fizz.base_inst.fixup.substitute(key_value, allow_invert=True),
+            )
+        brush_ent['targetname'] = conditions.local_name(
+            fizz.base_inst, self.name,
+        )
+        # Set this to the center, to make sure it's not going to leak.
+        brush_ent['origin'] = center
+        # For fizzlers flat on the floor/ceiling, scanlines look
+        # useless. Turn them off.
+        if 'usescanline' in brush_ent and fizz.normal().z:
+            brush_ent['UseScanline'] = 0
+        if self.set_axis_var:
+            brush_ent['vscript_init_code'] = f'axis <- `{fizz.normal().axis()}`;'
+        for out in self.outputs:
+            new_out = out.copy()
+            new_out.target = conditions.local_name(
+                fizz.base_inst,
+                new_out.target,
+            )
+            brush_ent.add_out(new_out)
+        return brush_ent
+
+
+def make_model_namer(fizz_type: FizzlerType, fizz_name: str) -> Callable[[int], str]:
+    """Define a function which applies the model naming."""
+    local_name = fizz_type.model_name
+    if fizz_type.model_naming is ModelName.SAME:
+        def get_model_name(_: int, /) -> str:
+            """Give every emitter the base's name."""
+            return fizz_name
+    elif fizz_type.model_naming is ModelName.LOCAL:
+        def get_model_name(_: int, /) -> str:
+            """Give every emitter a name local to the base."""
+            return f'{fizz_name}-{local_name}'
+    elif fizz_type.model_naming is ModelName.PAIRED:
+        def get_model_name(ind: int, /) -> str:
+            """Give each pair of emitters the same unique name."""
+            return f'{fizz_name}-{local_name}{ind:02}'
+    elif fizz_type.model_naming is ModelName.UNIQUE:
+        model_index = 0
+
+        def get_model_name(_: int, /) -> str:
+            """Give every model a unique name."""
+            nonlocal model_index
+            model_index += 1
+            return f'{fizz_name}-{local_name}{model_index:02}'
+    else:
+        raise assert_never(fizz_type.model_naming)
+    return get_model_name
+
 
 def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
     """Analyse fizzler instances to assign fizzler types.
@@ -999,23 +1110,25 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
     """
 
     # Item ID and model skin -> fizzler type
-    fizz_types: dict[tuple[str, int], FizzlerType] = {}
+    fizz_types: dict[tuple[utils.ObjectID, int], FizzlerType] = {}
 
     for fizz_type in FIZZ_TYPES.values():
-        for item_id in fizz_type.item_ids:
-            if ':' in item_id:
-                item_id, barrier_type = item_id.split(':')
+        for item_id_str in fizz_type.item_ids:
+            if ':' in item_id_str:
+                item_id_str, barrier_type = item_id_str.split(':')
+                item_id = utils.obj_id(item_id_str)
                 if barrier_type == 'LASERFIELD':
                     barrier_skin = 2
                 elif barrier_type == 'FIZZLER':
                     barrier_skin = 0
                 else:
-                    LOGGER.error('Invalid barrier type ({}) for "{}"!', barrier_type, item_id)
+                    LOGGER.error('Invalid barrier type ({}) for "{}"!', barrier_type, item_id_str)
                     fizz_types[item_id, 0] = fizz_type
                     fizz_types[item_id, 2] = fizz_type
                     continue
                 fizz_types[item_id, barrier_skin] = fizz_type
             else:
+                item_id = utils.obj_id(item_id_str)
                 fizz_types[item_id, 0] = fizz_type
                 fizz_types[item_id, 2] = fizz_type
 
@@ -1023,9 +1136,9 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
     fizz_models: dict[str, list[Entity]] = defaultdict(list)
 
     # Position and normal -> name, for output relays.
-    fizz_pos: dict[tuple[tuple[float, float, float], tuple[float, float, float]], str] = {}
+    fizz_pos: dict[tuple[FrozenVec, FrozenVec], str] = {}
 
-    # First use traits to gather up all the instances.
+    # First use traits to gather all the instances.
     for inst in vmf.by_class['func_instance']:
         traits = instance_traits.get(inst)
         if 'fizzler' not in traits:
@@ -1043,9 +1156,9 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
             LOGGER.warning('Fizzler "{}" has non-base, non-model instance?', name)
             continue
 
-        origin = Vec.from_str(inst['origin'])
-        normal = Vec(z=1) @ Angle.from_str(inst['angles'])
-        fizz_pos[origin.as_tuple(), normal.as_tuple()] = name
+        origin = FrozenVec.from_str(inst['origin'])
+        normal = FrozenVec(z=1) @ Angle.from_str(inst['angles'])
+        fizz_pos[origin, normal] = name
 
     for name, base_inst in fizz_bases.items():
         models = fizz_models[name]
@@ -1101,7 +1214,12 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
             max_pos[length_axis] += 64
             emitters.append((min_pos, max_pos))
 
-        FIZZLERS[name] = Fizzler(fizz_type, up_axis, base_inst, emitters)
+        FIZZLERS[name] = Fizzler(
+            fizz_type=fizz_type,
+            base_inst=base_inst,
+            up_axis=up_axis,
+            emitters=emitters,
+        )
 
     # Delete all the old brushes associated with fizzlers
     for brush in (
@@ -1117,7 +1235,7 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
             brush.remove()
 
     # Check for fizzler output relays.
-    relay_file = instanceLocs.resolve('<ITEM_BEE2_FIZZLER_OUT_RELAY>', silent=True)
+    relay_file = instanceLocs.resolve_filter('<ITEM_BEE2_FIZZLER_OUT_RELAY>', silent=True)
     if not relay_file:
         # No relay item - deactivated most likely.
         return
@@ -1132,8 +1250,8 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
 
         try:
             fizz_name = fizz_pos[
-                Vec.from_str(inst['origin']).as_tuple(),
-                (Vec(0, 0, 1) @ Angle.from_str(inst['angles'])).as_tuple()
+                FrozenVec.from_str(inst['origin']),
+                FrozenVec(0, 0, 1) @ Angle.from_str(inst['angles']),
             ]
             fizz_item = connections.ITEMS[fizz_name]
         except KeyError:
@@ -1163,8 +1281,8 @@ def parse_map(vmf: VMF, info: conditions.MapInfo) -> None:
             conn.from_item = fizz_item
 
 
-@conditions.meta_cond(priority=500, only_once=True)
-def generate_fizzlers(vmf: VMF) -> None:
+@conditions.MetaCond.Fizzler.register
+def generate_fizzlers(vmf: VMF, coll: Collisions) -> None:
     """Generates fizzler models and the brushes according to their set types.
 
     After this is done, fizzler-related conditions will not function correctly.
@@ -1172,6 +1290,7 @@ def generate_fizzlers(vmf: VMF) -> None:
     """
     has_fizz_border = 'fizz_border' in texturing.SPECIAL
     conf_tile_blacken = options.get_itemconf(('VALVE_FIZZLER', 'BlackenTiles'), False)
+    conf_goo_extend = options.get_itemconf(('VALVE_TEST_ELEM', 'ExtendGooBarrier'), False)
 
     for fizz in FIZZLERS.values():
         if fizz.base_inst not in vmf.entities:
@@ -1189,6 +1308,9 @@ def generate_fizzlers(vmf: VMF) -> None:
             and fizz.base_inst.fixup.bool('$start_enabled', True)
         )
         tile_blacken = conf_tile_blacken and fizz.fizz_type.blocks_portals
+        goo_extend = conf_goo_extend and fizz.up_axis.z > 0.9 and any(
+            brush.goo_extend for brush in fizz.fizz_type.brushes
+        )
 
         pack_list = (
             fizz.fizz_type.pack_lists_static
@@ -1211,16 +1333,13 @@ def generate_fizzlers(vmf: VMF) -> None:
         # template_brush is used for the templated one.
         single_brushes: dict[FizzlerBrush, Entity] = {}
 
-        if fizz_type.temp_max or fizz_type.temp_min:
+        if fizz_type.temp_max or fizz_type.temp_min or fizz_type.temp_single:
             template_brush_ent = vmf.create_ent(
                 classname='func_brush',
                 origin=fizz.base_inst['origin'],
             )
-            conditions.set_ent_keys(
-                template_brush_ent,
-                fizz.base_inst,
-                fizz_type.temp_brush_keys,
-            )
+            if fizz_type.temp_brush_keys is not None:
+                conditions.set_ent_keys(template_brush_ent, fizz.base_inst, fizz_type.temp_brush_keys)
         else:
             template_brush_ent = None
 
@@ -1239,34 +1358,13 @@ def generate_fizzlers(vmf: VMF) -> None:
             or fizz_type.inst[FizzInst.ALL, is_static]
         )
 
-        if not model_min or not model_max:
+        if not any(model_min) or not any(model_max):
             raise user_errors.UserError(
                 user_errors.TOK_FIZZLER_NO_MODEL_SIDE.format(id=fizz_type.id),
                 voxels=[pos for minmax in fizz.emitters for pos in minmax],
             )
 
-        # Define a function to do the model names.
-        model_index = 0
-        if fizz_type.model_naming is ModelName.SAME:
-            def get_model_name(ind: int) -> str:
-                """Give every emitter the base's name."""
-                return fizz_name
-        elif fizz_type.model_naming is ModelName.LOCAL:
-            def get_model_name(ind: int) -> str:
-                """Give every emitter a name local to the base."""
-                return f'{fizz_name}-{fizz_type.model_name}'
-        elif fizz_type.model_naming is ModelName.PAIRED:
-            def get_model_name(ind: int) -> str:
-                """Give each pair of emitters the same unique name."""
-                return f'{fizz_name}-{fizz_type.model_name}{ind:02}'
-        elif fizz_type.model_naming is ModelName.UNIQUE:
-            def get_model_name(ind: int) -> str:
-                """Give every model a unique name."""
-                nonlocal model_index
-                model_index += 1
-                return f'{fizz_name}-{fizz_type.model_name}{model_index:02}'
-        else:
-            raise AssertionError(f'No model name {fizz_type.model_name!r}')
+        get_model_name = make_model_namer(fizz_type, fizz_name)
 
         # Generate env_beam pairs.
         for beam in fizz_type.beams:
@@ -1321,7 +1419,7 @@ def generate_fizzlers(vmf: VMF) -> None:
             length = (seg_max - seg_min).mag()
             rng = rand.seed(b'fizz_seg', seg_min, seg_max)
             if length == 128 and fizz_type.inst[FizzInst.PAIR_SINGLE, is_static]:
-                # Assign to 'min' var so we can share some code.
+                # Assign to 'min' var, so we can share some code.
                 min_inst = conditions.add_inst(
                     vmf,
                     targetname=get_model_name(seg_ind),
@@ -1350,6 +1448,28 @@ def generate_fizzlers(vmf: VMF) -> None:
             min_inst.fixup.update(fizz.base_inst.fixup)
             instance_traits.get(min_inst).update(fizz_traits)
 
+            goo_runs = []
+            if goo_extend:
+                # Find runs of goo below the emitters.
+                vox_common = seg_min - Vec.dot(forward, seg_min)
+                vox_min = vox_common + forward * (math.floor(Vec.dot(forward, seg_min) / 128) * 128 + 64)
+                vox_max = vox_common + forward * (math.ceil(Vec.dot(forward, seg_max) / 128) * 128 - 64)
+                cur_goo_start: Vec | None = None
+                cur_goo_end: Vec | None = None
+                for pos in Vec.iter_line(vox_min, vox_max, 128):
+                    voxel = brushLoc.POS.lookup_world(pos - (0, 0, 128))
+                    if voxel.is_goo and voxel.is_top:
+                        cur_goo_end = seg_max if pos == vox_max else pos + 64 * forward
+                        if cur_goo_start is None:
+                            # Start a run
+                            cur_goo_start = seg_min if pos == vox_min else pos - 64 * forward
+                    else:
+                        if cur_goo_start is not None and cur_goo_end is not None:
+                            goo_runs.append((cur_goo_start, cur_goo_end))
+                        cur_goo_start = cur_goo_end = None
+                if cur_goo_start is not None and cur_goo_end is not None:
+                    goo_runs.append((cur_goo_start, cur_goo_end))
+
             if has_fizz_border or tile_blacken:
                 # noinspection PyProtectedMember
                 fizz._edit_border_tiles(vmf, seg_min, seg_max, has_fizz_border, tile_blacken)
@@ -1368,7 +1488,7 @@ def generate_fizzlers(vmf: VMF) -> None:
                     mid_pos = seg_min + forward * dist
                     mid_inst = conditions.add_inst(
                         vmf,
-                        targetname=fizz_name,
+                        targetname=get_model_name(seg_ind),
                         angles=min_orient.to_angle(),
                         file=rng.choice(fizz_type.inst[FizzInst.GRID, is_static]),
                         origin=mid_pos,
@@ -1378,32 +1498,39 @@ def generate_fizzlers(vmf: VMF) -> None:
 
             if template_brush_ent is not None:
                 if length == 128 and fizz_type.temp_single:
-                    temp = template_brush.import_template(
-                        vmf,
-                        fizz_type.temp_single,
-                        (seg_min + seg_max) / 2,
-                        min_orient,
-                        force_type=template_brush.TEMP_TYPES.world,
-                        add_to_map=False,
-                    )
-                    template_brush_ent.solids.extend(temp.world)
-                else:
-                    if fizz_type.temp_min:
+                    for temp_id in fizz_type.temp_single:
                         temp = template_brush.import_template(
                             vmf,
-                            fizz_type.temp_min,
-                            seg_min,
+                            temp_id,
+                            (seg_min + seg_max) / 2,
                             min_orient,
+                            coll=coll,
+                            targetname=fizz_name,
                             force_type=template_brush.TEMP_TYPES.world,
                             add_to_map=False,
                         )
                         template_brush_ent.solids.extend(temp.world)
-                    if fizz_type.temp_max:
+                else:
+                    for temp_id in fizz_type.temp_min:
                         temp = template_brush.import_template(
                             vmf,
-                            fizz_type.temp_max,
+                            temp_id,
+                            seg_min,
+                            min_orient,
+                            coll=coll,
+                            targetname=fizz_name,
+                            force_type=template_brush.TEMP_TYPES.world,
+                            add_to_map=False,
+                        )
+                        template_brush_ent.solids.extend(temp.world)
+                    for temp_id in fizz_type.temp_max:
+                        temp = template_brush.import_template(
+                            vmf,
+                            temp_id,
                             seg_max,
                             max_orient,
+                            coll=coll,
+                            targetname=fizz_name,
                             force_type=template_brush.TEMP_TYPES.world,
                             add_to_map=False,
                         )
@@ -1418,46 +1545,11 @@ def generate_fizzlers(vmf: VMF) -> None:
 
                 # Non-singular or not generated yet - make the entity.
                 if brush_ent is None:
-                    brush_ent = vmf.create_ent(classname='func_brush')
-
-                    for key_name, key_value in brush_type.keys.items():
-                        brush_ent[key_name] = fizz.base_inst.fixup.substitute(key_value, allow_invert=True)
-
-                    for key_name, key_value in brush_type.local_keys.items():
-                        brush_ent[key_name] = conditions.local_name(
-                            fizz.base_inst,
-                            fizz.base_inst.fixup.substitute(key_value, allow_invert=True),
-                        )
-
-                    brush_ent['targetname'] = conditions.local_name(
-                        fizz.base_inst, brush_type.name,
-                    )
-                    # Set this to the center, to make sure it's not going to leak.
-                    brush_ent['origin'] = (seg_min + seg_max)/2
-
-                    # For fizzlers flat on the floor/ceiling, scanlines look
-                    # useless. Turn them off.
-                    if 'usescanline' in brush_ent and fizz.normal().z:
-                        brush_ent['UseScanline'] = 0
+                    brush_ent = brush_type.generate_ent(vmf, fizz, (seg_min + seg_max)/2)
 
                     if brush_ent['classname'] == 'trigger_hurt':
                         trigger_hurt_name = brush_ent['targetname']
                         trigger_hurt_start_disabled = brush_ent['startdisabled']
-
-                    if brush_type.set_axis_var:
-                        brush_ent['vscript_init_code'] = (
-                            'axis <- `{}`;'.format(
-                                fizz.normal().axis(),
-                            )
-                        )
-
-                    for out in brush_type.outputs:
-                        new_out = out.copy()
-                        new_out.target = conditions.local_name(
-                            fizz.base_inst,
-                            new_out.target,
-                        )
-                        brush_ent.add_out(new_out)
 
                     if brush_type.singular:
                         # Record for the next iteration.
@@ -1470,20 +1562,41 @@ def generate_fizzlers(vmf: VMF) -> None:
                 if brush_type.mat_mod_var is not None:
                     used_tex_func = mat_mod_tex[brush_type].add
                 else:
-                    def used_tex_func(val):
+                    def used_tex_func(_: str, /) -> None:
                         """If not, ignore those calls."""
                         return None
 
                 # Generate the brushes and texture them.
                 brush_ent.solids.extend(
-                    brush_type.generate(
-                        vmf,
-                        fizz,
-                        seg_min,
-                        seg_max,
-                        used_tex_func,
-                    )
+                    brush_type.generate(vmf, fizz, seg_min, seg_max, used_tex_func)
                 )
+
+                if brush_type.goo_extend and goo_runs:
+                    # Extend this into the goo below. 96 would be the surface, but extend further to prevent
+                    # dipping cubes into goo.
+                    tex_primary = brush_type.textures.primary
+                    mat = brush_type.textures.goo or (
+                        tex_primary.center
+                        if isinstance(tex_primary, FizzTexture)
+                        else tex_primary
+                    )
+                    normal = fizz.normal()
+                    for start, end in goo_runs:
+                        if brush_type.singular:
+                            goo_brush_ent = brush_ent  # Can continue appending.
+                        else:
+                            # Need a separate one. Don't bother with the mat-mod, this should be invisible.
+                            goo_brush_ent = brush_type.generate_ent(
+                                vmf, fizz, (start + end) / 2 - Vec(0.0, 0.0, 104.0),
+                            )
+                            if goo_brush_ent['classname'] == 'trigger_portal_cleanser':
+                                goo_brush_ent['visible'] = '0'
+                                goo_brush_ent['usescanline'] = '0'
+                        goo_brush_ent.solids.append(vmf.make_prism(
+                            start - (brush_type.thickness / 2) * normal - 64 * fizz.up_axis,
+                            end + (brush_type.thickness / 2) * normal - 144 * fizz.up_axis,
+                            mat,
+                        ).solid)
 
         # We have a trigger_hurt in this fizzler, potentially generate
         # the flinching logic.
@@ -1494,14 +1607,16 @@ def generate_fizzlers(vmf: VMF) -> None:
                 trigger_hurt_start_disabled,
             )
 
-        # If we have the config, but no templates used anywhere in this brush,
-        # remove the empty brush entity.
+        # Remove the empty brush entity if we created a brush entity for templates
+        # but never actually used it.
         if template_brush_ent is not None and not template_brush_ent.solids:
             template_brush_ent.remove()
 
         # Generate the material modify controls.
         # One is needed for each texture used on the brush, unfortunately.
         for brush_type, used_tex in mat_mod_tex.items():
+            # Should not happen, the brush type is only added if the var is not None.
+            assert brush_type.mat_mod_var is not None, repr(brush_type)
             brush_name = conditions.local_name(fizz.base_inst, brush_type.name)
             mat_mod_name = conditions.local_name(fizz.base_inst, brush_type.mat_mod_name)
             for off, tex in zip(itertools.cycle(MATMOD_OFFSETS), sorted(used_tex)):

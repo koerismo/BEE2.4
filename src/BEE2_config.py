@@ -3,14 +3,17 @@
 It only saves if the values are modified.
 Most functions are also altered to allow defaults instead of erroring.
 """
-from configparser import ConfigParser, NoOptionError, SectionProxy, ParsingError
-from pathlib import Path
-from typing import Any, Optional, Iterator, Mapping
-from threading import Lock, Event
+from typing import Any
 
-import utils
+from collections.abc import Iterator, Mapping
+from configparser import ConfigParser, NoOptionError, ParsingError, SectionProxy
+from pathlib import Path
+from threading import Event, Lock
+
 from srctools import AtomicWriter
 import srctools.logger
+
+import utils
 
 
 LOGGER = srctools.logger.get_logger(__name__)
@@ -38,23 +41,26 @@ class ConfigFile(ConfigParser):
     get_val, get_bool, and get_int are modified to return defaults instead
     of erroring.
     """
-    filename: Optional[Path]
+    filename: Path | None
 
     def __init__(
         self,
-        filename: Optional[str],
+        filename: str | None,
         *,
-        in_conf_folder: bool=True,
-        auto_load: bool=True,
+        in_conf_folder: bool = True,
+        auto_load: bool = True,
+        legacy: bool = True,
     ) -> None:
         """Initialise the config file.
 
         `filename` is the name of the config file, in the `root` directory.
         If `auto_load` is true, this file will immediately be read and parsed.
-        If in_conf_folder is set, The folder is relative to the 'config/'
+        If `in_conf_folder` is set, the folder is relative to the 'config/'
         folder in the BEE2 folder.
+        If `legacy` is set, suppress errors if the file does not exist.
         """
-        super().__init__()
+        # Special section holding names outside braces, we never use this.
+        super().__init__(default_section='__XXX_DEFAULT_SECTION')
 
         self.has_changed = Event()
         self._file_lock = Lock()
@@ -65,28 +71,29 @@ class ConfigFile(ConfigParser):
             else:
                 self.filename = Path(filename)
             if auto_load:
-                self.load()
+                self.load(legacy)
         else:
             self.filename = None
 
-    def load(self) -> None:
+    def load(self, legacy: bool = False) -> None:
         """Load config options from disk."""
         if self.filename is None:
             return
 
         try:
-            with self._file_lock, open(self.filename, 'r', encoding='utf8') as conf:
+            with self._file_lock, open(self.filename, encoding='utf8') as conf:
                 self.read_file(conf)
-                # We're not different to the file on disk..
+                # We're no longer different to the file on disk...
                 self.has_changed.clear()
         # If missing, just use default values.
         except FileNotFoundError:
-            LOGGER.warning(
-                'Config "{}" not found! Using defaults...',
-                self.filename,
-            )
+            if not legacy:
+                LOGGER.warning(
+                    'Config "{}" not found! Using defaults...',
+                    self.filename,
+                )
         # But if we fail to read entirely, fall back to defaults.
-        except (IOError, ParsingError, UnicodeDecodeError):
+        except (OSError, ParsingError, UnicodeDecodeError):
             LOGGER.warning(
                 'Config "{}" cannot be read! Using defaults...',
                 self.filename,
@@ -96,7 +103,7 @@ class ConfigFile(ConfigParser):
             # but if it doesn't work don't worry about it.
             try:
                 self.filename.replace(self.filename.with_suffix('.err.cfg'))
-            except IOError:
+            except OSError:
                 pass
 
     def save(self) -> None:
@@ -149,7 +156,7 @@ class ConfigFile(ConfigParser):
             self[section] = {}
             return super().__getitem__(section)
 
-    def getboolean(self, section: str, value: str, default: bool=False, **kwargs) -> bool:  # type: ignore[override]
+    def getboolean(self, section: str, option: str, default: bool = False, **kwargs: Any) -> bool:
         """Get the value in the specified section, coercing to a Boolean.
 
             If either does not exist, set to the default and return it.
@@ -157,27 +164,27 @@ class ConfigFile(ConfigParser):
         if section not in self:
             self[section] = {}
         try:
-            return super().getboolean(section, value, **kwargs)
+            return super().getboolean(section, option, **kwargs)
         except (ValueError, NoOptionError):
             #  Invalid boolean, or not found
             self.has_changed.set()
-            self[section][value] = str(int(default))
+            self[section][option] = str(int(default))
             return default
 
     get_bool = getboolean
 
-    def getint(self, section: str, value: str, default: int=0, **kwargs) -> int:  # type: ignore[override]
-        """Get the value in the specified section, coercing to a Integer.
+    def getint(self, section: str, option: str, default: int = 0, **kwargs: Any) -> int:
+        """Get the value in the specified section, coercing to an Integer.
 
-            If either does not exist, set to the default and return it.
-            """
+        If either does not exist, set to the default and return it.
+        """
         if section not in self:
             self[section] = {}
         try:
-            return super().getint(section, value, **kwargs)
+            return super().getint(section, option, **kwargs)
         except (ValueError, NoOptionError):
             self.has_changed.set()
-            self[section][value] = str(int(default))
+            self[section][option] = str(int(default))
             return default
 
     get_int = getint
@@ -192,7 +199,7 @@ class ConfigFile(ConfigParser):
         self.has_changed.set()
         return super().remove_section(section)
 
-    def set(self, section: str, option: str, value: Any=None) -> None:
+    def set(self, section: str, option: str, value: Any = None) -> None:
         """Set an option, marking the file dirty if this changed it."""
         orig_val = self.get(section, option, fallback=None)
         value = str(value)

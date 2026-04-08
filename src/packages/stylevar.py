@@ -1,15 +1,17 @@
 """Style specific features which can be enabled or disabled."""
 from __future__ import annotations
+from typing import Final, override
 
-from typing import Iterator
+from collections.abc import Iterator, Mapping
 
+from packages import ExportKey, PackagesSet, PakObject, ParseData, Style
 from transtoken import TransToken, TransTokenSource
-from packages import PakObject, Style, ParseData, ExportData
-from srctools import Property, bool_as_int
 
 
 class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
     """Style specific features which can be enabled or disabled."""
+    export_info: Final[ExportKey[Mapping[str, bool]]] = ExportKey()
+
     def __init__(
         self,
         var_id: str,
@@ -40,6 +42,7 @@ class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
         return self.styles is None
 
     @classmethod
+    @override
     async def parse(cls, data: ParseData) -> StyleVar:
         """Parse StyleVars from configs."""
         name = TransToken.parse(data.pak_id, data.info['name', ''])
@@ -64,6 +67,7 @@ class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
             default=data.info.bool('enabled'),
         )
 
+    @override
     def add_over(self, override: StyleVar) -> None:
         """Override a stylevar to add more compatible styles."""
         # Setting it to be unstyled overrides any other values!
@@ -91,9 +95,10 @@ class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
         return (
             f'<Stylevar "{self.id}", name="{self.name}", '
             f'default={self.default}, '
-            f'styles={self.styles}>:\n{self.desc}'
+            f'styles={self.styles}>'
         )
 
+    @override
     def iter_trans_tokens(self) -> Iterator[TransTokenSource]:
         """Yield translation tokens used by this stylevar."""
         yield self.name, self.id + '.name'
@@ -103,7 +108,7 @@ class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
         """Check to see if this will apply for the given style.
 
         """
-        if self.is_unstyled:
+        if self.styles is None:
             return True
 
         if style.id in self.styles:
@@ -115,25 +120,12 @@ class StyleVar(PakObject, allow_mult=True, needs_foreground=True):
             style.bases
         )
 
-    def applies_to_all(self) -> bool:
+    def applies_to_all(self, packset: PackagesSet) -> bool:
         """Check if this applies to all styles."""
         if self.is_unstyled:
             return True
 
-        for style in Style.all():
+        for style in packset.all_obj(Style):
             if not self.applies_to_style(style):
                 return False
         return True
-
-    @staticmethod
-    def export(exp_data: ExportData) -> None:
-        """Export style var selections into the config.
-
-        The .selected attribute is a dict mapping ids to the boolean value.
-        """
-        # Add the StyleVars block, containing each style_var.
-        exp_data.vbsp_conf.append(Property('StyleVars', [
-            Property(key, bool_as_int(val))
-            for key, val in
-            exp_data.selected.items()
-        ]))

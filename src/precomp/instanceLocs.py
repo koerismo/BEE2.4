@@ -2,30 +2,40 @@
 
 This way VBSP_config files can generically refer to items, and work in
 multiple styles.
+
+Valid path styles:
+- "<ITEM_ID>" matches all indexes.
+- "<ITEM_ID:>" gives all indexes and custom extra instances.
+- "<ITEM_ID:1,2,5>": matches the given indexes for that item.
+- "<ITEM_ID:cube_black, cube_white>": the same, with strings for indexes
+- "<ITEM_ID:bee2_value>": Custom extra instances defined in editoritems.
+- "<ITEM_ID:bee2_value, 3, 2, cube_black>": Any combination of the above
+- "[spExitCorridor]": Hardcoded shortcuts for specific items
+- "path/to_instance": A single direct instance path.
 """
-import logging
-import re
+from __future__ import annotations
+from typing import overload
+from collections.abc import Callable, Iterable
 from collections import defaultdict
 from functools import lru_cache
+import logging
+import re
 
 import editoritems
 import srctools.logger
-
-from typing import (
-    Callable, Optional, Union,
-    List, Dict, Tuple, TypeVar, Iterable,
-)
 import corridor
 import user_errors
+import utils
 
 LOGGER = srctools.logger.get_logger(__name__)
 
 # The list of instances each item uses.
-INSTANCE_FILES: Dict[str, List[str]] = {}
+# TODO: Make this utils.ObjectID
+INSTANCE_FILES: dict[str, list[str]] = {}
 
 # Item ID and index/special name for instances set in editoritems.
 # Note this is imperfect - two items could reuse the same instance.
-ITEM_FOR_FILE: Dict[str, Tuple[str, Union[int, str]]] = {}
+ITEM_FOR_FILE: dict[str, tuple[utils.ObjectID, int | str]] = {}
 
 _RE_DEFS = re.compile(r'\s* (\[ [^][]+] | < [^<>]+ >) \s* ,? \s*', re.VERBOSE)
 _RE_SUBITEMS = re.compile(r'''
@@ -40,12 +50,13 @@ _RE_SUBITEMS = re.compile(r'''
 
 # A dict holding dicts of additional custom instance names - used to define
 # names in conditions or BEE2-added features.
-CUST_INST_FILES: Dict[str, Dict[str, str]] = defaultdict(dict)
+# TODO: Make this utils.ObjectID
+CUST_INST_FILES: dict[str, dict[str, str]] = defaultdict(dict)
 
 # Special names for some specific instances - those which have special
 # functionality which can't be used in custom items like entry/exit doors,
 # or indicator panels.
-SPECIAL_INST: Dict[str, str] = {
+SPECIAL_INST: dict[str, str] = {
     # Glass only generates borders for genuine ITEM_BARRIER items,
     # so it's possible to define special names.
     'glass_128':                 '<ITEM_BARRIER:0>',
@@ -126,7 +137,7 @@ SPECIAL_INST: Dict[str, str] = {
 }
 
 # The resolved versions of SPECIAL_INST
-INST_SPECIAL: Dict[str, List[str]] = {}
+INST_SPECIAL: dict[str, list[str]] = {}
 
 # Categories and prefixes for the corridors, so can update the values after
 CORR_SPECIALS = [
@@ -138,7 +149,7 @@ CORR_SPECIALS = [
 
 # Give names to reusable instance fields, so you don't need to remember
 # indexes
-SUBITEMS: Dict[str, Union[int, Tuple[int, ...]]] = {
+SUBITEMS: dict[str, int | tuple[int, ...]] = {
     # Cube
     'standard': 0,
     'companion': 1,
@@ -229,19 +240,23 @@ def load_conf(items: Iterable[editoritems.Item]) -> None:
         if item.cust_instances:
             CUST_INST_FILES[item.id.casefold()] = cust_instances = {}
             for name, file in item.cust_instances.items():
-                cust_instances[name] = folded = str(file).casefold()
-                ITEM_FOR_FILE[folded] = (item.id, name)
+                fname = str(file)
+                if fname == '.':
+                    cust_instances[name] = ''
+                else:
+                    cust_instances[name] = fname
+                    ITEM_FOR_FILE[fname.casefold()] = (item.id, name)
 
         # Normal instances: index -> filename
         INSTANCE_FILES[item.id.casefold()] = [
-            '' if inst.inst == EMPTY else str(inst.inst).casefold()
+            '' if inst.inst == EMPTY else str(inst.inst)
             for inst in item.instances
         ]
         for ind, inst in enumerate(item.instances):
-            fname = str(inst.inst).casefold()
+            fname = str(inst.inst)
             # Not real instances.
-            if fname != '.' and not fname.startswith('instances/bee2_corridor/'):
-                ITEM_FOR_FILE[fname] = (item.id, ind)
+            if fname != '.' and not fname.casefold().startswith('instances/bee2_corridor/'):
+                ITEM_FOR_FILE[fname.casefold()] = (item.id, ind)
 
     INST_SPECIAL.clear()
     INST_SPECIAL.update({
@@ -253,7 +268,7 @@ def load_conf(items: Iterable[editoritems.Item]) -> None:
 
 def set_chosen_corridor(
     sel_mode: corridor.GameMode,
-    selected: Dict[corridor.Direction, corridor.Corridor],
+    selected: dict[corridor.Direction, corridor.Corridor],
 ) -> None:
     """Alter our stored corridor filenames to include the selected corridor.
 
@@ -268,7 +283,7 @@ def set_chosen_corridor(
             inst = corr.instance.casefold()
             INST_SPECIAL[prefix] = [inst]
             for i in range(1, count + 1):
-                INST_SPECIAL[f'{prefix}{i}'] = [inst] if corr.orig_index == i else []
+                INST_SPECIAL[f'{prefix}{i}'] =  []
             # Update raw item IDs too. Pretend it's repeated for all.
             ITEM_FOR_FILE[inst] = (item_id, 0)
             INSTANCE_FILES[item_id.casefold()][:count] = [inst] * count
@@ -277,22 +292,13 @@ def set_chosen_corridor(
             for i in range(1, count + 1):
                 INST_SPECIAL[f'{prefix}{i}'] = []
             INSTANCE_FILES[item_id.casefold()][:count] = [''] * count
-    # Clear since these were evaluated before.
+    # Clear in case these were evaluated before.
     _resolve.cache_clear()
+    resolve_filter.cache_clear()
 
 
-def resolve(path: str, silent: bool=False) -> List[str]:
+def resolve(path: str, silent: bool = False) -> list[str]:
     """Resolve an instance path into the values it refers to.
-
-    Valid paths:
-    - "<ITEM_ID>" matches all indexes.
-    - "<ITEM_ID:>" gives all indexes and custom extra instances.
-    - "<ITEM_ID:1,2,5>": matches the given indexes for that item.
-    - "<ITEM_ID:cube_black, cube_white>": the same, with strings for indexes
-    - "<ITEM_ID:bee2_value>": Custom extra instances defined in editoritems.
-    - "<ITEM_ID:bee2_value, 3, 2, cube_black>": Any combination of the above
-    - "[spExitCorridor]": Hardcoded shortcuts for specific items
-    - "path/to_instance": A single direct instance path
 
     This returns a list of instances which match the selector, or an empty list
     if it's invalid. Incorrect [] will raise an exception (since these are
@@ -315,10 +321,25 @@ def resolve(path: str, silent: bool=False) -> List[str]:
     else:
         return _resolve(path)
 
-Default_T = TypeVar('Default_T')
+
+@lru_cache(maxsize=100)
+def resolve_filter(path: str, silent: bool = False) -> frozenset[str]:
+    """Resolve an instance path into a list of instances, for filtering.
+
+    This skips empty filenames, and filters them all.
+    """
+    return frozenset({
+        filename.casefold()
+        for filename in resolve(path, silent)
+        if filename
+    })
 
 
-def resolve_one(path, default: Union[str, Default_T]='', *, error: bool) -> Union[str, Default_T]:
+@overload
+def resolve_one(path: str, *, error: bool) -> str: ...
+@overload
+def resolve_one[Default](path: str, default: Default) -> str | Default: ...
+def resolve_one[Default](path: str, default: str | Default = '', *, error: bool = False) -> str | Default:
     """Resolve a path into one instance.
 
     If multiple are given, this returns the first.
@@ -342,7 +363,7 @@ def resolve_one(path, default: Union[str, Default_T]='', *, error: bool) -> Unio
 
 # Cache the return values, since they're constant.
 @lru_cache(maxsize=100)
-def _resolve(path: str) -> List[str]:
+def _resolve(path: str) -> list[str]:
     """Use a secondary function to allow caching values, while ignoring the
     'silent' parameter.
     """
@@ -351,15 +372,13 @@ def _resolve(path: str) -> List[str]:
         out = []
         for group in groups:
             if group[0] == '<':
-                try:
-                    item_id, subitems = _RE_SUBITEMS.fullmatch(group).groups()
-                except (ValueError, AttributeError):  # None.groups fail
+                subitem_match = _RE_SUBITEMS.fullmatch(group)
+                if subitem_match is None:
                     LOGGER.warning('Could not parse instance lookup "{}"!', group)
                     return []
-
-                item_id = item_id.casefold()
+                item_id, subitems = subitem_match.groups()
                 try:
-                    item_inst = INSTANCE_FILES[item_id]
+                    item_inst = INSTANCE_FILES[item_id.casefold()]
                 except KeyError:
                     LOGGER.warning('"{}" is not a valid item!', item_id)
                     return []
@@ -378,28 +397,28 @@ def _resolve(path: str) -> List[str]:
                     continue
             else:
                 raise Exception(group)
-        # Remove "" from the output.
-        return list(filter(None, out))
+        return out
     else:
-        return [path.casefold()]
+        return [path]
 
 
-def get_subitems(comma_list: str, item_inst: List[str], item_id: str) -> List[str]:
+def get_subitems(comma_list: str, item_inst: list[str], item_id: str) -> list[str]:
     """Pick out the subitems from a list."""
-    output: List[Union[str, int]] = []
+    output: list[str | int] = []
+    folded_id = item_id.casefold()
     for val in comma_list.split(','):
         folded_value = val.strip().casefold()
         if folded_value.startswith('bee2_'):
             # A custom value...
-            bee_inst = CUST_INST_FILES[item_id]
+            bee_inst = CUST_INST_FILES[folded_id]
             try:
-                output.append(bee_inst[folded_value[5:]])
+                output.append(bee_inst[folded_value.removeprefix('bee2_')])
                 continue
             except KeyError:
                 LOGGER.warning(
                     'Invalid custom instance name - "{}" for '
                     '<{}> (Valid: {!r})',
-                    folded_value[5:],
+                    folded_value,
                     item_id,
                     bee_inst,
                 )
@@ -412,16 +431,9 @@ def get_subitems(comma_list: str, item_inst: List[str], item_id: str) -> List[st
                 ind = int(folded_value)
             except ValueError:
                 LOGGER.info('--------\nValid subitems:')
-                LOGGER.info('\n'.join(
-                    ('> ' + k + ' = ' + str(v))
-                    for k, v in
-                    SUBITEMS.items()
-                ))
+                LOGGER.info('\n'.join([f'> {k} = {v}' for k, v in SUBITEMS.items()]))
                 LOGGER.info('--------')
-                raise Exception(
-                    '"' + val + '" is not a valid instance'
-                                ' subtype or index!'
-                )
+                raise Exception(f'"{val}" is not a valid instance subtype or index!') from None
         # SUBITEMS has tuple values, which represent multiple sub-items.
         if isinstance(ind, tuple):
             output.extend(ind)
@@ -448,29 +460,9 @@ def get_subitems(comma_list: str, item_inst: List[str], item_id: str) -> List[st
 resolve_cache_info: Callable[[], object] = _resolve.cache_info
 
 
-def get_cust_inst(item_id: str, inst: str) -> Optional[str]:
+def get_cust_inst(item_id: str, inst: str) -> str | None:
     """Get the filename used for a custom instance defined in editoritems.
 
     This returns None if the given value is not present.
     """
     return CUST_INST_FILES[item_id.casefold()].get(inst.casefold(), None)
-
-
-def get_special_inst(name: str):
-    """Get the instance associated with a "[special]" instance path."""
-    try:
-        inst = INST_SPECIAL[name.casefold()]
-    except KeyError:
-        raise KeyError("Invalid special instance name! ({})".format(name))
-
-    # The number you'll get is fixed, so it's fine if we return different
-    # types.
-    # Unpack single instances, since that's what you want most of the
-    # time. We only do that if there's no ',' in the <> lookup, so it doesn't
-    # affect
-    if len(inst) == 1 and ',' not in SPECIAL_INST_FOLDED[name.casefold()]:
-        return inst[0]
-    elif len(inst) == 0:
-        return ()
-    else:
-        return inst

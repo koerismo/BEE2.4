@@ -1,13 +1,15 @@
 """Original result used to generate unstationary scaffolds, kept for backwards compatibility."""
-from decimal import Decimal
-from typing import Dict, Tuple, Optional, Any, Union
+from __future__ import annotations
+
+from typing import Any, cast
 from enum import Enum
 import math
 
-from srctools import Vec, Property, VMF
+from srctools import Vec, Keyvalues, VMF
 import srctools.logger
 
 from precomp import instanceLocs, item_chain, conditions
+import utils
 
 
 class LinkType(Enum):
@@ -17,24 +19,14 @@ class LinkType(Enum):
     END = 'end'
 
 
-COND_MOD_NAME = None
+COND_MOD_NAME: str | None = None
 
 LOGGER = srctools.logger.get_logger(__name__, alias='cond._scaffold_compat')
 
 
-def scaff_scan(inst_list, start_ent):
-    """Given the start item and instance list, follow the programmed path."""
-    cur_ent = start_ent
-    while True:
-        yield cur_ent
-        cur_ent = inst_list.get(cur_ent['next'], None)
-        if cur_ent is None:
-            return
-
-
 def get_config(
-    node: item_chain.Node,
-) -> Tuple[str, Vec]:
+    node: item_chain.Node[dict[str, Any]],
+) -> tuple[str, Vec]:
     """Compute the config values for a node."""
 
     orient = ('floor' if abs(node.orient.up().z) > 0.9 else 'wall')
@@ -53,10 +45,10 @@ def get_config(
     return orient, offset
 
 
-def resolve_optional(prop: Property, key: str) -> Optional[str]:
+def resolve_optional(kv: Keyvalues, key: str) -> str | None:
     """Resolve the given instance, or return None if not defined."""
     try:
-        file = prop[key]
+        file = kv[key]
     except LookupError:
         return None
     return instanceLocs.resolve_one(file, error=False)
@@ -66,17 +58,17 @@ def resolve_optional(prop: Property, key: str) -> Optional[str]:
 SCAFF_PATTERN = '{name}_group{group}_part{index}'
 
 # Store the configs for scaffold items, so we can join them up later
-SCAFFOLD_CONFIGS: Dict[str, Tuple[
-    Dict[str, Dict[str, Union[bool, str, Vec, None]]],
-    Dict[str, Dict[str, Optional[str]]],
+SCAFFOLD_CONFIGS: dict[str, tuple[
+    dict[str, dict[str, bool | str | Vec | None]],
+    dict[str, dict[str, str | None]],
 ]] = {}
 
 
-@conditions.make_result('UnstScaffold')
-def res_old_unst_scaffold(res: Property) -> None:
+@conditions.make_result('UnstScaffold', valid_before=conditions.MetaCond.ScaffoldLinkOld)
+def res_old_unst_scaffold(res: Keyvalues) -> None:
     """The pre-2.4.40 version of the condition used to generate Unstationary Scaffolds.
 
-    This has since been swapped to use the LinkedItems result, but this is kept for package
+    This has since been swapped to use the [LinkedItems](#LinkedItems) result, but this is kept for package
     compatiblity.
     """
     group = res['group', 'DEFAULT_GROUP']
@@ -89,7 +81,7 @@ def res_old_unst_scaffold(res: Property) -> None:
         targ_inst, links = SCAFFOLD_CONFIGS[group]
 
     for block in res.find_all("Instance"):
-        conf: Dict[str, Union[bool, str, Vec, None]] = {
+        conf: dict[str, bool | str | Vec | None] = {
             # If set, adjusts the offset appropriately
             'is_piston': srctools.conv_bool(block['isPiston', '0']),
             'rotate_logic': srctools.conv_bool(block['AlterAng', '1'], True),
@@ -116,8 +108,9 @@ def res_old_unst_scaffold(res: Property) -> None:
             if conf[logic_type + '_rev'] is None:
                 conf[logic_type + '_rev'] = conf[logic_type]
 
-        for filename in instanceLocs.resolve(block['file']):
-            targ_inst[filename] = conf
+        targ_inst.update(
+            dict.fromkeys(instanceLocs.resolve_filter(block['file']), conf)
+        )
 
     # We need to provide vars to link the tracks and beams.
     for block in res.find_all('LinkEnt'):
@@ -140,9 +133,12 @@ def res_old_unst_scaffold(res: Property) -> None:
     )
 
 
-@conditions.meta_cond(priority=Decimal('-250.0001'))
+@conditions.MetaCond.ScaffoldLinkOld.register
 def legacy_scaffold_link(vmf: VMF) -> None:
-    """Apply the legacy scaffold logic."""
+    """Apply the legacy [scaffold](#UnstScaffold) logic.
+
+    Prefer using [LinkedItems](#LinkedItems) instead.
+    """
     if not SCAFFOLD_CONFIGS:
         return
 
@@ -220,6 +216,7 @@ def legacy_scaffold_link(vmf: VMF) -> None:
                     else:
                         other_node = node.prev
 
+                    assert other_node is not None, (node, link_type)
                     other_offset = get_config(other_node)[1]
                     link_dir = other_offset - offset
 
@@ -240,7 +237,7 @@ def legacy_scaffold_link(vmf: VMF) -> None:
                             targetname=node.inst['targetname'],
                             file=conf['inst_end'],
                             origin=offset,
-                            angles='0 {:.0f} 0'.format(link_ang),
+                            angles=f'0 {link_ang:.0f} 0',
                         )
                         # Don't place the offset instance, this replaces that!
                         placed_endcap = True
@@ -259,14 +256,14 @@ def legacy_scaffold_link(vmf: VMF) -> None:
                 logic_inst = vmf.create_ent(
                     classname='func_instance',
                     targetname=node.inst['targetname'],
-                    file=conf.get(
+                    file=cast(str, conf.get(
                         'logic_' + link_type.value + (
                             '_rev' if
                             should_reverse
                             else ''
                             ),
                         '',
-                    ),
+                    )),
                     origin=offset,
                     angles=(
                         '0 0 0' if
@@ -278,13 +275,13 @@ def legacy_scaffold_link(vmf: VMF) -> None:
                 # Add the link-values
                 for linkVar, link in LINKS.items():
                     node.inst.fixup[linkVar] = SCAFF_PATTERN.format(
-                        name=link['name'],
+                        name=utils.not_none(link['name']),
                         group=group_counter,
                         index=index,
                     )
                     if node.next is not None:
-                        node.inst.fixup[link['next']] = SCAFF_PATTERN.format(
-                            name=link['name'],
+                        node.inst.fixup[utils.not_none(link['next'])] = SCAFF_PATTERN.format(
+                            name=utils.not_none(link['name']),
                             group=group_counter,
                             index=index + 1,
                         )

@@ -1,30 +1,31 @@
 """Conditions related to packing."""
-from typing import Dict, Set
+from __future__ import annotations
 
+from srctools import VMF, Keyvalues
 import srctools.logger
-from precomp import options, conditions
-from srctools import VMF, Property, Vec
+
+from precomp import conditions, options
 
 
 LOGGER = srctools.logger.get_logger(__name__)
 COND_MOD_NAME = 'Packing'
 
 # Filenames we've packed, so we can avoid adding duplicate ents.
-_PACKED_FILES = set()  # type: Set[str]
+_PACKED_FILES: set[str] = set()
 
-PACKLISTS = {}  # type: Dict[str, Set[str]]
+PACKLISTS: dict[str, set[str]] = {}
 
 
-def parse_packlists(props: Property) -> None:
+def parse_packlists(kv: Keyvalues) -> None:
     """Parse the packlists.cfg file, to load our packing lists."""
-    for prop in props.find_children('Packlist'):
-        PACKLISTS[prop.name] = set(prop.as_array())
+    for child in kv.find_children('Packlist'):
+        PACKLISTS[child.name] = set(child.as_array())
 
 
 def pack_list(
     vmf: VMF,
     packlist_name: str,
-    file_type: str='generic',
+    file_type: str = 'generic',
 ) -> None:
     """Pack the given packing list."""
     if not packlist_name:
@@ -40,7 +41,7 @@ def pack_list(
 def pack_files(
     vmf: VMF,
     *files: str,
-    file_type: str='generic',
+    file_type: str = 'generic',
 ) -> None:
     """Add the given files to the packing list."""
 
@@ -51,7 +52,7 @@ def pack_files(
 
     ent = vmf.create_ent(
         classname='comp_pack',
-        origin=options.get(Vec, 'global_ents_loc'),
+        origin=options.GLOBAL_ENTS_LOC(),
     )
 
     for i, file in enumerate(packlist, start=1):
@@ -59,15 +60,14 @@ def pack_files(
 
 
 @conditions.make_result('Pack')
-def res_packlist(vmf: VMF, res: Property):
+def res_packlist(vmf: VMF, res: Keyvalues) -> object:
     """Pack files from a packing list."""
     pack_list(vmf, res.value)
     return conditions.RES_EXHAUSTED
 
 
 @conditions.make_result('PackFile')
-def pack_file_cond(vmf: VMF, res: Property):
+def pack_file_cond(vmf: VMF, res: Keyvalues) -> object:
     """Adda single file to the map."""
     pack_files(vmf, res.value)
     return conditions.RES_EXHAUSTED
-

@@ -42,23 +42,24 @@ As of version 4.37 we have stopped supporting BEE2.4 on Mac. See [this wiki arti
 
 ### Compilation ###
 
-* You'll need Python 3.8 or later, for 32-bit / Windows 7 you need 3.8 specifically.
-* First, grab the 3 git repositories you need:
+* You'll need Python 3.12 or later.
+* First, grab the repo and then clone the HammerAddons submodule:
 
-	    git clone https://github.com/TeamSpen210/HammerAddons.git
-	    git clone https://github.com/BEEmod/BEE2.4.git
+	    git clone --recurse-submodules https://github.com/BEEmod/BEE2.4.git
+	    cd BEE2.4
+	    git submodule update --init
 
 * Run `python -m pip install -r requirements.txt` to install the required packages. On Linux, 
-Pillow might need to be installed via the system package manager with the TK component: 
-`python-pillow`, `python-pillow.imagetk`.
+Pillow, TK and IDLE might need to be installed via the system package manager:
+`python-pillow`, `python-pillow.imagetk`, `python-tkinter`, `python-idle`, etc.
 
 * To allow sound effects in the app, you need a copy of FFmpeg:
 	* In the `BEE2.4` folder, add `lib-32` and/or `lib-64/` folders.
 	* Download the [32-bit](https://github.com/sudo-nautilus/FFmpeg-Builds-Win32/releases) or [64-bit](https://github.com/BtbN/FFmpeg-Builds/releases) builds (`winXX-lgpl-shared`), then copy the contents of the `bin` folder into the appropriate `lib-XX` folder mentioned.
 
-* Finally, switch to the BEE2.4 repo and build the compiler, then the application:
+* Finally, switch to the BEE2.4 repo and build the compiler, then the application (You should be in the BEE2.4 folder already):
 
-	    cd BEE2.4/src/
+	    cd src/
 	    pyinstaller --distpath ../dist/64bit/ --workpath ../build_tmp compiler.spec
 	    pyinstaller --distpath ../dist/64bit/ --workpath ../build_tmp BEE2.spec
 	
@@ -67,3 +68,5 @@ To generate the packages zips, either manually zip the contents of each folder o
 use the `compile_packages` script in BEE2-items. 
 This does the same thing, but additionally removes some unnessary content 
 to decrease file sizes - comments, blank lines, hidden visgroups.
+
+* For Linux Compilation check out this wiki entry [Building from Source](https://github.com/BEEmod/BEE2-items/wiki/Building-from-source) 

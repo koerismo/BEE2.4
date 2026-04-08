@@ -1,11 +1,7 @@
-import os
-from typing import List
-
-from srctools import Property
+from typing import override
 import srctools.logger
 
-import config
-from packages import PakObject, ParseData, ExportData
+from packages import PakObject, ParseData
 
 
 LOGGER = srctools.logger.get_logger(__name__)
@@ -13,11 +9,12 @@ LOGGER = srctools.logger.get_logger(__name__)
 
 class PackList(PakObject, allow_mult=True):
     """Specifies a group of resources which can be packed together."""
-    def __init__(self, pak_id: str, files: List[str]) -> None:
+    def __init__(self, pak_id: str, files: list[str]) -> None:
         self.id = pak_id
         self.files = files
 
     @classmethod
+    @override
     async def parse(cls, data: ParseData) -> 'PackList':
         """Read pack lists from packages."""
         filesystem = data.fsys
@@ -57,38 +54,10 @@ class PackList(PakObject, allow_mult=True):
 
         return cls(data.id, files)
 
+    @override
     def add_over(self, override: 'PackList') -> None:
         """Override items just append to the list of files."""
         # Don't copy over if it's already present
         for item in override.files:
             if item not in self.files:
                 self.files.append(item)
-
-    @staticmethod
-    def export(exp_data: ExportData) -> None:
-        """Export all the packlists."""
-
-        pack_block = Property('PackList', [])
-
-        for pack in exp_data.packset.all_obj(PackList):
-            # Build a
-            # "Pack_id"
-            # {
-            # "File" "filename"
-            # "File" "filename"
-            # }
-            # block for each packlist
-            files = [
-                Property('File', file)
-                for file in
-                pack.files
-            ]
-            pack_block.append(Property(
-                pack.id,
-                files,
-            ))
-
-        LOGGER.info('Writing packing list!')
-        with open(exp_data.game.abs_path('bin/bee2/pack_list.cfg'), 'w') as pack_file:
-            for line in pack_block.export():
-                pack_file.write(line)

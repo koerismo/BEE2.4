@@ -1,16 +1,18 @@
 """Implements the customisable Signage item."""
-from typing import Tuple, Dict, Optional, Iterable, List
+from __future__ import annotations
+
+from collections.abc import Iterable
 from enum import Enum
 
 import srctools.logger
 from precomp import tiling, texturing, template_brush, conditions
 import consts
-from srctools import Property, Entity, VMF, Vec, NoKeyError, Matrix
+from srctools import Keyvalues, Entity, VMF, Vec, NoKeyError, Matrix
 from srctools.vmf import make_overlay, Side
 import vbsp
 
 
-COND_MOD_NAME = None
+COND_MOD_NAME: str | None = None
 
 LOGGER = srctools.logger.get_logger(__name__, alias='cond.signage')
 
@@ -21,7 +23,8 @@ class SignType(Enum):
     TALL = 'tall'  # Half-wide
     WIDE = 'wide'  # Half-height
 
-SIZES: Dict[SignType, Tuple[int, int]] = {
+
+SIZES: dict[SignType, tuple[int, int]] = {
     SignType.DEFAULT: (32, 32),
     SignType.TALL: (16, 32),
     SignType.WIDE: (32, 16),
@@ -34,30 +37,31 @@ class Sign:
         self,
         world: str,
         overlay: str,
-        sign_type: SignType=SignType.DEFAULT,
+        sign_type: SignType = SignType.DEFAULT,
     ) -> None:
         self.world = world
         self.overlay = overlay
-        self.primary: Optional['Sign'] = None
-        self.secondary: Optional['Sign'] = None
+        self.primary: Sign | None = None
+        self.secondary: Sign | None = None
         self.type = sign_type
 
     @classmethod
-    def parse(cls, prop: Property) -> 'Sign':
+    def parse(cls, kv: Keyvalues) -> Sign:
+        """Parse from keyvalues data."""
         return cls(
-            prop['world', ''],
-            prop['overlay', ''],
-            SignType(prop['type', 'square']),
+            kv['world', ''],
+            kv['overlay', ''],
+            SignType(kv['type', 'square']),
         )
 
 
-SIGNAGES: Dict[str, Sign] = {}
+SIGNAGES: dict[str, Sign] = {}
 
 # Special connection signage type.
-CONN_SIGNAGES: Dict[str, Sign] = {
+CONN_SIGNAGES: dict[str, Sign] = {
     str(time): Sign('', f'<overlay.{sign}>')
     for time, sign in
-    zip(range(3, 31), [
+    enumerate([
         'square',
         'cross',
         'dot',
@@ -68,11 +72,11 @@ CONN_SIGNAGES: Dict[str, Sign] = {
         'star',
         'circle',
         'wavy',
-    ])
+    ], start=3)
 }
 
 
-def load_signs(conf: Property) -> None:
+def load_signs(conf: Keyvalues) -> None:
     """Load in the signage data."""
     for prop in conf.find_children('Signage'):
         SIGNAGES[prop.name] = sign = Sign.parse(prop)
@@ -93,9 +97,9 @@ def load_signs(conf: Property) -> None:
 
 
 @conditions.make_result('SignageItem')
-def res_signage(vmf: VMF, inst: Entity, res: Property):
+def res_signage(vmf: VMF, inst: Entity, res: Keyvalues) -> None:
     """Implement the Signage item."""
-    sign: Optional[Sign]
+    sign: Sign | None
     try:
         sign = (
             CONN_SIGNAGES if
@@ -109,8 +113,8 @@ def res_signage(vmf: VMF, inst: Entity, res: Property):
     has_arrow = inst.fixup.bool(consts.FixupVars.ST_ENABLED)
     make_4x4 = res.bool('set4x4tile')
 
-    sign_prim: Optional[Sign]
-    sign_sec: Optional[Sign]
+    sign_prim: Sign | None
+    sign_sec: Sign | None
 
     if has_arrow:
         sign_prim = sign
@@ -152,8 +156,8 @@ def res_signage(vmf: VMF, inst: Entity, res: Property):
         inst['origin'] = prim_pos if sign_prim else sec_pos
     conditions.ALL_INST.add(fname.casefold())
 
-    brush_faces: List[Side] = []
-    tiledef: Optional[tiling.TileDef] = None
+    brush_faces: list[Side] = []
+    tiledef: tiling.TileDef | None = None
 
     if template_id:
         if sign_prim and sign_sec:
@@ -170,10 +174,10 @@ def res_signage(vmf: VMF, inst: Entity, res: Property):
             force_type=template_brush.TEMP_TYPES.detail,
             additional_visgroups=visgroup,
         )
-
-        for face in template.detail.sides():
-            if face.normal() == normal:
-                brush_faces.append(face)
+        if template.detail is not None:
+            for face in template.detail.sides():
+                if face.normal() == normal:
+                    brush_faces.append(face)
     else:
         # Direct on the surface.
         # Find the grid pos first.
@@ -243,7 +247,7 @@ def place_sign(
     pos: Vec,
     normal: Vec,
     forward: Vec,
-    rotate: bool=True,
+    rotate: bool = True,
 ) -> Entity:
     """Place the sign into the map."""
     if rotate and abs(normal.z) < 0.1:
@@ -253,7 +257,7 @@ def place_sign(
     texture = sign.overlay
     if texture.startswith('<') and texture.endswith('>'):
         gen, tex_name = texturing.parse_name(texture[1:-1])
-        texture = gen.get(pos, tex_name)
+        texture = gen.get(pos, tex_name).mat
 
     width, height = SIZES[sign.type]
     over = make_overlay(

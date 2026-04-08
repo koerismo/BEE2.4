@@ -1,17 +1,24 @@
 """Defines the palette data structure and file saving/loading logic."""
 from __future__ import annotations
-from typing import IO, Iterator
+
+from typing import IO, TypeGuard, Literal, Final, assert_never, cast
+
+from collections.abc import Sequence
+from pathlib import Path
+from uuid import UUID, uuid4, uuid5
 import os
 import shutil
 import zipfile
 import random
 import io
-from uuid import UUID, uuid4, uuid5
+import sys
 
+from srctools import Keyvalues, NoKeyError, KeyValError
 import srctools.logger
-from srctools import Property, NoKeyError, KeyValError
 
+from app.dialogs import Dialogs, TRANS_BTN_QUIT, TRANS_BTN_SKIP, TRANS_BTN_DISCARD
 from transtoken import TransToken
+from consts import DefaultItems
 import config
 import consts
 import utils
@@ -19,8 +26,20 @@ import utils
 
 LOGGER = srctools.logger.get_logger(__name__)
 PAL_DIR = utils.conf_location('palettes/')
-GROUP_BUILTIN = '<BUILTIN>'
-PAL_EXT = '.bee2_palette'
+GROUP_BUILTIN: Final = '<BUILTIN>'
+PAL_EXT: Final = '.bee2_palette'
+CUR_VERSION: Final = 3
+
+type HorizInd = Literal[0, 1, 2, 3]
+type VertInd = Literal[0, 1, 2, 3, 4, 5, 6, 7]
+type Coord = tuple[HorizInd, VertInd]
+type ItemPos = dict[Coord, tuple[utils.ObjectID, int]]
+type BuiltinPal = list[list[
+    tuple[DefaultItems | utils.ObjectID, int],
+]]
+HORIZ: Final[Sequence[HorizInd]] = cast(Sequence[HorizInd], range(4))
+VERT: Final[Sequence[VertInd]] = cast(Sequence[VertInd], range(8))
+COORDS: Sequence[Coord] = [(x, y) for y in VERT for x in HORIZ]
 
 # Allow translating the names of the built-in palettes
 TRANS_NAMES: dict[str, TransToken] = {
@@ -41,174 +60,212 @@ TRANS_NAMES: dict[str, TransToken] = {
 }
 
 # The original palette, plus BEEmod 1 and Aperture Tag's palettes.
-DEFAULT_PALETTES: dict[str, list[tuple[str, int]]] = {
+DEFAULT_PALETTES: dict[str, BuiltinPal] = {
     'EMPTY': [],
     'PORTAL2': [
-        ("ITEM_BUTTON_PEDESTAL", 0),
-        ("ITEM_BUTTON_FLOOR", 0),  # Weighted
-        ("ITEM_BUTTON_FLOOR", 1),  # Cube
-        ("ITEM_BUTTON_FLOOR", 2),  # Ball
-
-        ("ITEM_CUBE", 0),  # Standard
-        ("ITEM_CUBE", 1),  # Companion
-        ("ITEM_CUBE", 3),  # Sphere
-        ("ITEM_CUBE", 4),  # Franken
-
-        ("ITEM_TBEAM", 0),
-        ("ITEM_CATAPULT", 0),
-        ("ITEM_LIGHT_BRIDGE", 0),
-        ("ITEM_PANEL_STAIRS", 0),
-
-        ("ITEM_BARRIER_HAZARD", 0),  # Fizzler
-        ("ITEM_BARRIER", 0),  # Glass
-        ("ITEM_PISTON_PLATFORM", 0),
-        ("ITEM_RAIL_PLATFORM", 0),
-
-        ("ITEM_LASER_EMITTER_CENTER", 0),
-        ("ITEM_LASER_CATCHER_CENTER", 0),
-        ("ITEM_LASER_RELAY_CENTER", 0),
-        ("ITEM_CUBE", 2),  # Reflect
-
-        ("ITEM_PANEL_CLEAR", 0),
-        ("ITEM_PANEL_ANGLED", 0),
-        ("ITEM_PANEL_FLIP", 0),
-        ("ITEM_SECONDARY_OBSERVATION_ROOM", 0),
-
-        ("ITEM_BARRIER_HAZARD", 1),  # Laserfield
-        ("ITEM_TURRET", 0),
-        ("ITEM_GOO", 0),
-        ("ITEM_LIGHT_PANEL", 0),  # Cold
-
-        ("ITEM_PAINT_SPLAT", 0),  # Bounce
-        ("ITEM_PAINT_SPLAT", 1),  # Speed
-        ("ITEM_PAINT_SPLAT", 2),  # Portal
-        ("ITEM_PAINT_SPLAT", 3),  # Erase
+        [
+            (DefaultItems.button_pedestal, 0),
+            (DefaultItems.button_floor, 0),  # Weighted
+            (DefaultItems.button_floor, 1),  # Cube
+            (DefaultItems.button_floor, 2),  # Ball
+        ], [
+            (DefaultItems.cube, 0),  # Standard
+            (DefaultItems.cube, 1),  # Companion
+            (DefaultItems.cube, 3),  # Sphere
+            (DefaultItems.cube, 4),  # Franken
+        ], [
+            (DefaultItems.funnel, 0),
+            (DefaultItems.faith_plate, 0),
+            (DefaultItems.light_bridge, 0),
+            (DefaultItems.panel_stairs, 0),
+        ], [
+            (DefaultItems.fizzler, 0),  # Fizzler
+            (DefaultItems.glass, 0),
+            (DefaultItems.piston_platform, 0),
+            (DefaultItems.track_platform, 0),
+        ], [
+            (DefaultItems.laser_emitter_center, 0),
+            (DefaultItems.laser_catcher_center, 0),
+            (DefaultItems.laser_relay_center, 0),
+            (DefaultItems.cube, 2),  # Reflect
+        ], [
+            (DefaultItems.panel_glass, 0),
+            (DefaultItems.panel_angled, 0),
+            (DefaultItems.panel_flip, 0),
+            (DefaultItems.obs_room_small, 0),
+        ], [
+            (DefaultItems.fizzler, 1),  # Laserfield
+            (DefaultItems.turret, 0),
+            (DefaultItems.goo, 0),
+            (DefaultItems.light_strip, 0),  # Cold
+        ], [
+            (DefaultItems.gel_splat, 0),  # Bounce
+            (DefaultItems.gel_splat, 1),  # Speed
+            (DefaultItems.gel_splat, 2),  # Portal
+            (DefaultItems.gel_splat, 3),  # Erase
+        ]
     ],
     'BEEMOD': [
-        ("ITEM_BUTTON_PEDESTAL", 0),
-        ("ITEM_BUTTON_FLOOR", 0),
-        ("ITEM_CUBE", 0),
-        ("ITEM_PAINT_SPLAT", 3),  # Erase
-
-        ("ITEM_TBEAM", 0),
-        ("ITEM_CATAPULT", 0),
-        ("ITEM_DRAW_BRIDGE", 0),
-        ("ITEM_PANEL_STAIRS", 0),
-
-        ("ITEM_BARRIER_HAZARD", 0),
-        ("ITEM_LIGHT_BRIDGE", 0),
-        ("ITEM_PISTON_PLATFORM", 0),
-        ("ITEM_RAIL_PLATFORM", 0),
-
-        ("ITEM_LASER_EMITTER_CENTER", 0),
-        ("ITEM_LASER_CATCHER_CENTER", 0),
-        ("ITEM_LASER_RELAY_CENTER", 0),
-        ("ITEM_BARRIER", 0),
-
-        ("ITEM_PANEL_CLEAR", 0),
-        ("ITEM_PANEL_ANGLED", 0),
-        ("ITEM_PANEL_FLIP", 0),
-        ("ITEM_SECONDARY_OBSERVATION_ROOM", 0),
-
-        ("ITEM_GOO", 0),
-        ("ITEM_TURRET", 0),
-        ("ITEM_CRUSHER", 0),
-        ("ITEM_VENT", 0),
-
-        ("ITEM_HIGH_ENERGY_PELLET_EMITTER", 0),
-        ("ITEM_HIGH_ENERGY_PELLET_CATCHER", 0),
-        ("DOOR", 0),
-        ("ITEM_LIGHT_PANEL", 0),  # Cold
-
-        ("ITEM_TRIGGERS", 0),
-        ("ITEM_BEE_LOGIC", 0),
-        ("ITEM_AUTOPORTAL", 0),
-        ("ITEM_LIGHT_PANEL", 1),  # Warm
+        [
+            (DefaultItems.button_pedestal, 0),
+            (DefaultItems.button_floor, 0),
+            (DefaultItems.cube, 0),
+            (DefaultItems.gel_splat, 3),  # Erase
+        ], [
+            (DefaultItems.funnel, 0),
+            (DefaultItems.faith_plate, 0),
+            (utils.obj_id("ITEM_DRAW_BRIDGE"), 0),
+            (DefaultItems.panel_stairs, 0),
+        ], [
+            (DefaultItems.fizzler, 0),  # Fizzler
+            (DefaultItems.light_bridge, 0),
+            (DefaultItems.piston_platform, 0),
+            (DefaultItems.track_platform, 0),
+        ], [
+            (DefaultItems.laser_emitter_center, 0),
+            (DefaultItems.laser_catcher_center, 0),
+            (DefaultItems.laser_relay_center, 0),
+            (DefaultItems.glass, 0),
+        ], [
+            (DefaultItems.panel_glass, 0),
+            (DefaultItems.panel_angled, 0),
+            (DefaultItems.panel_flip, 0),
+            (DefaultItems.obs_room_small, 0),
+        ], [
+            (DefaultItems.goo, 0),
+            (DefaultItems.turret, 0),
+            (utils.obj_id("ITEM_CRUSHER"), 0),
+            (utils.obj_id("ITEM_VENT"), 0),
+        ], [
+            (utils.obj_id("ITEM_HIGH_ENERGY_PELLET_EMITTER"), 0),
+            (utils.obj_id("ITEM_HIGH_ENERGY_PELLET_CATCHER"), 0),
+            (utils.obj_id("DOOR"), 0),
+            (DefaultItems.light_strip, 0),  # Cold
+        ], [
+            (utils.obj_id("ITEM_TRIGGERS"), 0),
+            (utils.obj_id("ITEM_BEE_LOGIC"), 0),
+            (utils.obj_id("ITEM_AUTOPORTAL"), 0),
+            (DefaultItems.light_strip, 1),  # Warm
+        ],
     ],
 
     'P2_COLLAPSED': [
-        ("ITEM_BUTTON_PEDESTAL", 0),
-        ("ITEM_BUTTON_FLOOR", 0),
-        ("ITEM_CUBE", 0),
-        ("ITEM_PAINT_SPLAT", 3),  # Erase
-        ("ITEM_TBEAM", 0),
-        ("ITEM_CATAPULT", 0),
-        ("ITEM_PANEL_STAIRS", 0),
-        ("ITEM_LIGHT_PANEL", 0),
-        ("ITEM_BARRIER_HAZARD", 0),
-        ("ITEM_LIGHT_BRIDGE", 0),
-        ("ITEM_PISTON_PLATFORM", 0),
-        ("ITEM_RAIL_PLATFORM", 0),
-        ("ITEM_LASER_EMITTER_CENTER", 0),
-        ("ITEM_LASER_CATCHER_CENTER", 0),
-        ("ITEM_LASER_RELAY_CENTER", 0),
-        ("ITEM_BARRIER", 0),
-        ("ITEM_PANEL_CLEAR", 0),
-        ("ITEM_PANEL_ANGLED", 0),
-        ("ITEM_PANEL_FLIP", 0),
-        ("ITEM_SECONDARY_OBSERVATION_ROOM", 0),
-        ("ITEM_GOO", 0),
-        ("ITEM_TURRET", 0),
+        [
+            (DefaultItems.button_pedestal, 0),
+            (DefaultItems.button_floor, 0),
+            (DefaultItems.cube, 0),
+            (DefaultItems.gel_splat, 3),  # Erase
+        ], [
+            (DefaultItems.funnel, 0),
+            (DefaultItems.faith_plate, 0),
+            (DefaultItems.panel_stairs, 0),
+            (DefaultItems.light_strip, 0),
+        ], [
+            (DefaultItems.fizzler, 0),
+            (DefaultItems.light_bridge, 0),
+            (DefaultItems.piston_platform, 0),
+            (DefaultItems.track_platform, 0),
+        ], [
+            (DefaultItems.laser_emitter_center, 0),
+            (DefaultItems.laser_catcher_center, 0),
+            (DefaultItems.laser_relay_center, 0),
+            (DefaultItems.glass, 0),
+        ], [
+            (DefaultItems.panel_glass, 0),
+            (DefaultItems.panel_angled, 0),
+            (DefaultItems.panel_flip, 0),
+            (DefaultItems.obs_room_small, 0),
+        ], [
+            (DefaultItems.goo, 0),
+            (DefaultItems.turret, 0),
+        ],
     ],
 
     'APTAG': [
-        # Original has 4 paint fizzler items at the top.
-
-        ("ITEM_BUTTON_PEDESTAL", 0),
-        ("ITEM_BUTTON_FLOOR", 0),
-        ("ITEM_CUBE", 0),
-        ("ITEM_PAINT_SPLAT", 3),  # Erase
-
-        ("ITEM_TBEAM", 0),
-        ("ITEM_CATAPULT", 0),
-        ("ITEM_DRAW_BRIDGE", 0),
-        ("ITEM_PANEL_STAIRS", 0),
-
-        ("ITEM_BARRIER_HAZARD", 0),
-        ("ITEM_LIGHT_BRIDGE", 0),
-        ("ITEM_PISTON_PLATFORM", 0),
-        ("ITEM_RAIL_PLATFORM", 0),
-
-        ("ITEM_LASER_EMITTER_CENTER", 0),
-        ("ITEM_LASER_CATCHER_CENTER", 0),
-        ("ITEM_LASER_RELAY_CENTER", 0),
-        ("ITEM_BARRIER", 0),
-
-        ("ITEM_PANEL_CLEAR", 0),
-        ("ITEM_PANEL_ANGLED", 0),
-        ("ITEM_PANEL_FLIP", 0),
-        ("ITEM_SECONDARY_OBSERVATION_ROOM", 0),
-
-        ("ITEM_GOO", 0),
-        ("ITEM_TURRET", 0),
-        ("ITEM_CRUSHER", 0),
-        ("ITEM_VENT", 0),
-
-        ("ITEM_HIGH_ENERGY_PELLET_EMITTER", 0),
-        ("ITEM_HIGH_ENERGY_PELLET_CATCHER", 0),
-        ("DOOR", 0),
-        ("ITEM_LIGHT_PANEL", 0),  # Cold
-
-        ("ITEM_TRIGGERS", 0),
-        ("ITEM_BEE_LOGIC", 0),
-        ("ITEM_AUTOPORTAL", 0),
-        ("ITEM_TAG_GUN_ACTIVATOR", 0),
+        [],  # Original has 4 paint fizzler items at the top.
+        [
+            (DefaultItems.button_pedestal, 0),
+            (DefaultItems.button_floor, 0),
+            (DefaultItems.cube, 0),
+            (DefaultItems.gel_splat, 3),  # Erase
+        ], [
+            (DefaultItems.funnel, 0),
+            (DefaultItems.faith_plate, 0),
+            (utils.obj_id("ITEM_DRAW_BRIDGE"), 0),
+            (DefaultItems.panel_stairs, 0),
+        ], [
+            (DefaultItems.fizzler, 0),
+            (DefaultItems.light_bridge, 0),
+            (DefaultItems.piston_platform, 0),
+            (DefaultItems.track_platform, 0),
+        ], [
+            (DefaultItems.laser_emitter_center, 0),
+            (DefaultItems.laser_catcher_center, 0),
+            (DefaultItems.laser_relay_center, 0),
+            (DefaultItems.glass, 0),
+        ], [
+            (DefaultItems.panel_glass, 0),
+            (DefaultItems.panel_angled, 0),
+            (DefaultItems.panel_flip, 0),
+            (DefaultItems.obs_room_small, 0),
+        ], [
+            (DefaultItems.goo, 0),
+            (DefaultItems.turret, 0),
+            (utils.obj_id("ITEM_CRUSHER"), 0),
+            (utils.obj_id("ITEM_VENT"), 0),
+        ], [
+            (utils.obj_id("ITEM_HIGH_ENERGY_PELLET_EMITTER"), 0),
+            (utils.obj_id("ITEM_HIGH_ENERGY_PELLET_CATCHER"), 0),
+            (utils.obj_id("DOOR"), 0),
+            (DefaultItems.light_strip, 0),  # Cold
+        ], [
+            (utils.obj_id("ITEM_TRIGGERS"), 0),
+            (utils.obj_id("ITEM_BEE_LOGIC"), 0),
+            (utils.obj_id("ITEM_AUTOPORTAL"), 0),
+            (utils.obj_id("ITEM_TAG_GUN_ACTIVATOR"), 0),
+        ],
     ]
 }
 
 
+def validate_x(x: int) -> TypeGuard[HorizInd]:
+    """Validate that this is a valid horizontal coordinate."""
+    return x in HORIZ
+
+
+def validate_y(y: int) -> TypeGuard[VertInd]:
+    """Validate that this is a valid vertical coordinate."""
+    return y in VERT
+
+
+class FutureVersionError(Exception):
+    """Raised if a palette is from a future version."""
+    def __init__(self, version: str) -> None:
+        super().__init__(f'Unknown version {version}!')
+        self.version = version
+
+
 class Palette:
     """A palette, saving an arrangement of items for editoritems.txt"""
+    settings: config.Config | None
+    filename: str | None
+    uuid: UUID
+    group: str
+    readonly: bool
+    trans_name: str
+    items: ItemPos
+    name: TransToken
+
     def __init__(
         self,
         name: str,
-        pos: list[tuple[str, int]],
+        items: ItemPos,
         trans_name: str = '',
         readonly: bool = False,
         group: str = '',
-        filename: str = None,
+        filename: str | None = None,
         settings: config.Config | None = None,
-        uuid: UUID = None,
+        uuid: UUID | None = None,
     ) -> None:
         # Name of the palette
         self.trans_name = trans_name
@@ -232,8 +289,8 @@ class Palette:
         # If loaded from a file, the path to use.
         # None determines a filename automatically.
         self.filename = filename
-        # List of id, index tuples.
-        self.pos = pos
+        # x/y -> item, subtype tuple.
+        self.items = items
         # If true, prevent overwriting the original file
         # (premade palettes or <LAST EXPORT>)
         self.readonly = readonly
@@ -247,90 +304,160 @@ class Palette:
         return f'<Palette {self.name!r} @ {self.uuid}>'
 
     @classmethod
-    def parse(cls, path: str) -> Palette:
-        """Parse a palette from a file."""
-        needs_save = False
-        with open(path, encoding='utf8') as f:
-            props = Property.parse(f, path)
-        name = props['Name', '??']
-        items = []
-        for item in props.find_children('Items'):
-            items.append((item.real_name, int(item.value)))
+    async def parse(
+        cls,
+        kv: Keyvalues,
+        path: str,
+        dialogs: Dialogs,
+    ) -> tuple[Palette, bool]:
+        """Parse a palette from a file.
 
-        trans_name = props['TransName', '']
+        The returned boolean indicates if it should be resaved.
+        """
+        needs_upgrade = False
+        version = kv.int('version', 1)
+        name = kv['Name', '??']
+        readonly = kv.bool('readonly')
+
+        items: ItemPos = {}
+
+        # v2 reused the Items key, v3 restores a copy of the old block for backward compat.
+        if version in (2, 3):
+            for item_prop in kv.find_children('Positions' if version == 3 else 'Items'):
+                try:
+                    x_str, y_str = item_prop.name.split()
+                    x = int(x_str)
+                    y = int(y_str)
+                    if not validate_x(x) or not validate_y(y):
+                        raise ValueError
+                except ValueError:
+                    LOGGER.warning('Invalid position {} in palette "{}"!', item_prop.name, path)
+                    continue
+                try:
+                    item_id = utils.obj_id(item_prop['id'])
+                except LookupError:
+                    LOGGER.warning('No item in position ({}, {})', x, y)
+                    continue
+                except ValueError as exc:
+                    LOGGER.warning('Invalid item ID:', exc_info=exc)
+                    continue
+                items[x, y] = (item_id, item_prop.int('subtype', 0))
+
+        elif version == 1:
+            for pos, item in zip(COORDS, kv.find_children('Items'), strict=False):
+                items[pos] = (utils.obj_id(item.name), int(item.value))
+        elif version < 1:
+            raise ValueError(f'Invalid version {version}!')
+        else:
+            raise FutureVersionError(str(version))
+
+        if version != CUR_VERSION:
+            needs_upgrade = True
+
+        trans_name = kv['TransName', '']
         if trans_name:
             # Builtin, force a fixed uuid. This is mainly for LAST_EXPORT.
             uuid = uuid5(consts.PALETTE_NS, trans_name)
         else:
             try:
-                uuid = UUID(hex=props['UUID'])
+                uuid = UUID(hex=kv['UUID'])
             except (ValueError, LookupError):
                 uuid = uuid4()
-                needs_save = True
+                needs_upgrade = True
 
         settings: config.Config | None
         try:
-            settings_conf = props.find_key('Settings')
+            settings_conf = kv.find_key('Settings')
         except NoKeyError:
             settings = None
         else:
-            settings, upgraded_settings = config.APP.parse_kv1(settings_conf)
+            settings, upgraded_settings, unknown = config.PALETTE.parse_kv1(settings_conf)
+            if unknown:
+                message = config.build_version_mismatch_prompt(
+                    unknown, can_skip=not readonly, pal_name=name,
+                )
+                # XXX: useless walrus assignment required for mypy#17230
+                match _ := await dialogs.ask_custom(
+                    message,
+                    TRANS_BTN_QUIT, TRANS_BTN_DISCARD,
+                    None if readonly else TRANS_BTN_SKIP,
+                    cancel=0,
+                ):
+                    case 0:
+                        sys.exit()
+                    case 1:
+                        pass  # Continue
+                    case 2:
+                        raise FutureVersionError('<configs>')
+                    case never:
+                        assert_never(never)
+
             if upgraded_settings:
-                needs_save = True
+                needs_upgrade = True
 
         pal = Palette(
             name,
             items,
             trans_name=trans_name,
-            group=props['group', ''],
-            readonly=props.bool('readonly'),
+            group=kv['group', ''],
+            readonly=readonly,
             filename=os.path.basename(path),
             uuid=uuid,
             settings=settings,
         )
-        if needs_save:
-            LOGGER.info('Resaving older palette file {}', pal.filename)
-            pal.save()
-        return pal
+        return pal, needs_upgrade
 
     def save(self, ignore_readonly: bool = False) -> None:
         """Save the palette file into the specified location.
 
         If ignore_readonly is true, this will ignore the `readonly`
         property of the palette (allowing resaving those properties over old
-        versions). Otherwise those palettes always create a new file.
+        versions). Otherwise, those palettes always create a new file.
         """
         LOGGER.info('Saving "{}"!', self.name)
-        props = Property.root(
-            Property('Name', 'name'),
-            Property('TransName', 'trans_name'),
-            Property('Group', self.group),
-            Property('ReadOnly', srctools.bool_as_int(self.readonly)),
-            Property('UUID', self.uuid.hex),
-            Property('Items', [
-                Property(item_id, str(subitem))
-                for item_id, subitem in self.pos
-            ])
+        item_kv = Keyvalues('Positions', [])
+        # Still support v1 app, by writing them out as the original block.
+        legacy_kv = Keyvalues('Items', [])
+        kv = Keyvalues.root(
+            Keyvalues('Name', 'name'),
+            Keyvalues('Version', str(CUR_VERSION)),
+            Keyvalues('TransName', 'trans_name'),
+            Keyvalues('Group', self.group),
+            Keyvalues('ReadOnly', srctools.bool_as_int(self.readonly)),
+            Keyvalues('UUID', self.uuid.hex),
+            item_kv,
+            legacy_kv,
         )
-        # If default, don't include in the palette file.
+        for (x, y) in COORDS:
+            try:
+                item_id, subtype = self.items[x, y]
+            except KeyError:
+                pass
+            else:
+                item_kv.append(Keyvalues(f'{x} {y}', [
+                    Keyvalues('id', item_id),
+                    Keyvalues('subtype', str(subtype)),
+                ]))
+                legacy_kv.append(Keyvalues(item_id, str(subtype)))
+
+        # If defaulted, don't include in the palette file.
         # Remove the translated name, in case it's not going to write
         # properly to the file.
         if self.trans_name:
-            props['TransName'] = self.trans_name
-            props['Name'] = ''
+            kv['TransName'] = self.trans_name
+            kv['Name'] = ''
         else:
-            props['Name'] = self.name.token
-            del props['TransName']
+            kv['Name'] = self.name.token
+            del kv['TransName']
 
         if self.settings is not None:
-            settings_prop = Property('settings', [])
-            settings_prop.extend(config.APP.build_kv1(self.settings))
-            props.append(settings_prop)
+            settings_prop = Keyvalues('settings', [])
+            settings_prop.extend(config.PALETTE.build_kv1(self.settings))
+            kv.append(settings_prop)
 
         # We need to write a new file, determine a valid path.
-        # Use a hash to ensure it's a valid path (without '-' if negative)
-        # If a conflict occurs, add ' ' and hash again to get a different
-        # value.
+        # Use a hash to ensure it's a valid path (without '-' if negative).
+        # If a conflict occurs, add a character and hash again to get a different value.
         if self.filename is None or (self.readonly and not ignore_readonly):
             hash_src = self.name.token
             while True:
@@ -345,29 +472,36 @@ class Palette:
         else:
             file = open(os.path.join(PAL_DIR, self.filename), 'w', encoding='utf8')
         with file:
-            for line in props.export():
-                file.write(line)
+            kv.serialise(file)
 
     def delete_from_disk(self) -> None:
         """Delete this palette from disk."""
         if self.filename is not None:
             os.remove(os.path.join(PAL_DIR, self.filename))
 
-
-def load_palettes() -> Iterator[Palette]:
-    """Scan and read in all palettes. Legacy files will be converted in the process."""
-    name: str
-    # Load our builtin palettes.
-    for name, items in DEFAULT_PALETTES.items():
-        LOGGER.info('Loading builtin "{}"', name)
-        yield Palette(
+    @classmethod
+    def builtin(cls, name: str, items: BuiltinPal) -> Palette:
+        """Build a palette object for a builtin palette"""
+        return Palette(
             name,
-            items,
+            {
+                (x, y): ((item.id if isinstance(item, DefaultItems) else item), subtype)
+                for y, row in enumerate(items)
+                for x, (item, subtype) in enumerate(row)
+                if validate_x(x) and validate_y(y)
+            },
             name,
             readonly=True,
             group=GROUP_BUILTIN,
             uuid=uuid5(consts.PALETTE_NS, name),
         )
+
+
+async def load_palettes(dialogs: Dialogs) -> list[Palette]:
+    """Scan and read in all palettes. Legacy files will be converted in the process."""
+    palettes = []
+    for name, items in DEFAULT_PALETTES.items():
+        palettes.append(Palette.builtin(name, items))
 
     for name in os.listdir(PAL_DIR):  # this is both files and dirs
         LOGGER.info('Loading "{}"', name)
@@ -379,11 +513,21 @@ def load_palettes() -> Iterator[Palette]:
             if name.endswith(PAL_EXT):
                 try:
                     with srctools.logger.context(name):
-                        yield Palette.parse(path)
+                        with open(path, encoding='utf8') as f:
+                            kv = Keyvalues.parse(f, path)
+                        pal, needs_upgrade = await Palette.parse(kv, path, dialogs)
                 except KeyValError as exc:
                     # We don't need the traceback, this isn't an error in the app
                     # itself.
                     LOGGER.warning('Could not parse palette file, skipping:\n{}', exc)
+                except FutureVersionError as fut:
+                    LOGGER.warning('Palette file "{}" using future version {}, skipping...',  name, fut.version)
+                else:
+                    if needs_upgrade:
+                        LOGGER.info('Resaving older palette file {}', pal.filename)
+                        config.backup_conf(Path(path), ".bak")
+                        pal.save(ignore_readonly=True)
+                    palettes.append(pal)
                 continue
             elif name.endswith('.zip'):
                 # Extract from a zip
@@ -392,26 +536,26 @@ def load_palettes() -> Iterator[Palette]:
                     prop_file = io.TextIOWrapper(zip_file.open('properties.txt'), encoding='ascii', errors='ignore')
             elif os.path.isdir(path):
                 # Open from the subfolder
-                pos_file = open(os.path.join(path, 'positions.txt'))
-                prop_file = open(os.path.join(path, 'properties.txt'))
+                pos_file = open(os.path.join(path, 'positions.txt'), encoding='ascii', errors='ignore')
+                prop_file = open(os.path.join(path, 'properties.txt'), encoding='ascii', errors='ignore')
             else:  # A non-palette file, skip it.
                 LOGGER.debug('Skipping "{}"', name)
                 continue
-        except (KeyError, FileNotFoundError, zipfile.BadZipFile):
+        except (KeyError, FileNotFoundError, zipfile.BadZipFile) as exc:
             #  KeyError is returned by zipFile.open() if file is not present
-            LOGGER.warning('Bad palette file "{}"!', name)
+            LOGGER.warning('Bad palette file "{}"!', name, exc_info=exc)
             continue
         else:
-            # Legacy parsing of BEE2.2 files..
-            pal = parse_legacy(pos_file, prop_file, name)
-            if pal is not None:
-                yield pal
-            else:
+            # Legacy parsing of BEE2.2 files...
+            try:
+                palettes.append(parse_legacy(pos_file, prop_file, name))
+            except ValueError as exc:
+                LOGGER.warning('Failed to parse "{}":', name, exc_info=exc)
                 continue
         finally:
-            if pos_file:
+            if pos_file is not None:
                 pos_file.close()
-            if prop_file:
+            if prop_file is not None:
                 prop_file.close()
 
         LOGGER.warning('"{}" is a legacy palette - resaving!', name)
@@ -424,13 +568,15 @@ def load_palettes() -> Iterator[Palette]:
             pal.readonly = True
             pal.save()
             shutil.rmtree(path)
+    return palettes
 
 
-def parse_legacy(posfile, propfile, path) -> Palette | None:
+def parse_legacy(posfile: IO[str], propfile: IO[str], path: str) -> Palette:
     """Parse the original BEE2.2 palette format."""
-    props = Property.parse(propfile, path + ':properties.txt')
-    name = props['name', 'Unnamed']
-    pos = []
+    kv = Keyvalues.parse(propfile, path + ':properties.txt')
+    name = kv['name', 'Unnamed']
+    pos: ItemPos = {}
+    coords = iter(COORDS)
     for dirty_line in posfile:
         line = srctools.clean_line(dirty_line)
         if line:
@@ -440,16 +586,12 @@ def parse_legacy(posfile, propfile, path) -> Palette | None:
             if line.startswith('"'):
                 val = line.split('",')
                 if len(val) == 2:
-                    pos.append((
-                        val[0][1:],  # Item ID
-                        int(val[1].strip()),  # Item subtype
-                        ))
+                    item_id = val[0][1:]
+                    subtype = int(val[1])
+                    try:
+                        pos[next(coords)] = (utils.obj_id(item_id), subtype)
+                    except StopIteration:
+                        raise ValueError('Too many items!') from None
                 else:
-                    LOGGER.warning('Malformed row "{}"!', line)
-                    return None
+                    raise ValueError(f'Malformed row "{line}"!')
     return Palette(name, pos)
-
-if __name__ == '__main__':
-    results = load_palettes()
-    for palette in results:
-        print(palette)

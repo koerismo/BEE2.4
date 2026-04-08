@@ -1,36 +1,49 @@
 """Configures which signs are defined for the Signage item."""
-from typing import Optional, Sequence, Tuple, List, Dict
-import tkinter as tk
-import trio
-from tkinter import ttk
+from __future__ import annotations
+from typing import Final, TypeGuard
+
+from collections.abc import Iterator, Sequence
+from datetime import timedelta
+import abc
 
 import srctools.logger
+import trio
+import trio_util
 
-from app import dragdrop, img, localisation, tk_tools, TK_ROOT
+from app import ReflowWindow, WidgetCache, dragdrop, img
 from config.signage import DEFAULT_IDS, Layout
-from packages import Signage, Style
-import packages
+from packages import PakRef, Signage, Style
 from transtoken import TransToken
+import async_util
 import config
+import packages
+import utils
+
 
 LOGGER = srctools.logger.get_logger(__name__)
+type SignRef = PakRef[Signage]
+type SignSlot = dragdrop.Slot[SignRef]
 
-window = tk.Toplevel(TK_ROOT)
-window.withdraw()
 
-drag_man: dragdrop.Manager[Signage] = dragdrop.Manager(window)
-SLOTS_SELECTED: Dict[int, dragdrop.Slot[Signage]] = {}
 # The valid timer indexes for signs.
 SIGN_IND: Sequence[int] = range(3, 31)
-IMG_ERROR = img.Handle.error(64, 64)
-IMG_BLANK = img.Handle.color(img.PETI_ITEM_BG, 64, 64)
+IMG_ERROR: Final[img.Handle] = img.Handle.error(64, 64)
+IMG_BLANK: Final[img.Handle] = img.Handle.background(64, 64)
 
-TRANS_SIGN_NAME = TransToken.ui('Signage: {name}')
+TRANS_SIGN_NAME: Final = TransToken.ui('Signage: {name}')
+TRANS_UNKNOWN_SIGN: Final = TransToken.ui('Unknown Signage: {id}')
+TRANS_TITLE: Final = TransToken.ui('Configure Signage')
+TRANS_SELECTED: Final = TransToken.ui('Selected')
 
 
-def export_data() -> List[Tuple[str, str]]:
+def is_full(value: SignRef | None) -> TypeGuard[SignRef]:
+    """Predicate for valid contents."""
+    return value is not None
+
+
+def export_data() -> Signage.ExportInfo:
     """Returns selected items, for Signage.export() to use."""
-    conf: Layout = config.APP.get_cur_conf(Layout, default=Layout())
+    conf: Layout = config.APP.get_cur_conf(Layout)
     return [
         (str(ind), sign_id)
         for ind in SIGN_IND
@@ -38,189 +51,230 @@ def export_data() -> List[Tuple[str, str]]:
     ]
 
 
-async def apply_config(data: Layout) -> None:
-    """Apply saved signage info to the UI."""
-    for timer in SIGN_IND:
+def get_icon(sign: Signage, style: Style) -> img.Handle:
+    """Get the icon currently in use for a sign."""
+    for potential_style in style.bases:
         try:
-            slot = SLOTS_SELECTED[timer]
+            return sign.styles[potential_style.reference()].icon
         except KeyError:
-            LOGGER.warning('Invalid timer value {}!', timer)
-            continue
-
-        value = data.signs.get(timer, '')
-        if value:
-            try:
-                slot.contents = packages.LOADED.obj_by_id(Signage, value)
-            except KeyError:
-                LOGGER.warning('No signage with id "{}"!', value)
-        else:
-            slot.contents = None
-
-
-def style_changed(new_style: Style) -> None:
-    """Update the icons for the selected signage."""
-    icon: Optional[img.Handle]
-    for sign in packages.LOADED.all_obj(Signage):
-        for potential_style in new_style.bases:
-            try:
-                icon = sign.styles[potential_style.id.upper()].icon
-                break
-            except KeyError:
-                pass
-        else:
-            LOGGER.warning(
-                'No valid <{}> style for "{}" signage!',
-                new_style.id,
-                sign.id,
-            )
-            try:
-                icon = sign.styles['BEE2_CLEAN'].icon
-            except KeyError:
-                sign.dnd_icon = IMG_ERROR
-                continue
-        if icon:
-            sign.dnd_icon = icon
-        else:
-            LOGGER.warning(
-                'No icon for "{}" signage in <{}> style!',
-                sign.id,
-                new_style.id,
-            )
-            sign.dnd_icon = IMG_ERROR
-    if window.winfo_ismapped():
-        drag_man.load_icons()
+            pass
+    LOGGER.warning(
+        'No valid <{}> style for "{}" signage!',
+        style.id,
+        sign.id,
+    )
+    try:
+        return sign.styles[PakRef(Style, packages.CLEAN_STYLE)].icon
+    except KeyError:
+        return IMG_ERROR
 
 
-async def init_widgets(master: tk.Widget) -> Optional[tk.Widget]:
-    """Construct the widgets, returning the configuration button.
-    """
-    window.resizable(True, True)
-    localisation.set_win_title(window, TransToken.ui('Configure Signage'))
+class SignageUIBase[ParentT](ReflowWindow):
+    """Common implementation of the signage chooser."""
+    _slots: dict[int, dragdrop.Slot[SignRef]]
+    _cur_style_id: PakRef[Style]
+    picker_slots: WidgetCache[SignSlot]
 
-    frame_selected = ttk.Labelframe(window, relief='raised', labelanchor='n')
-    localisation.set_text(frame_selected, TransToken.ui('Selected'))
+    @property
+    @abc.abstractmethod
+    def drag_man(self) -> dragdrop.ManagerBase[SignRef, ParentT]:
+        """Subclasses must create an appropriate drag manager.
 
-    canv_all = tk.Canvas(window)
+        We can't require this to be passed into __init__(), since that ends up requiring
+        HKT in _create_slots().
+        """
+        ...
 
-    scroll = tk_tools.HidingScroll(window, orient='vertical', command=canv_all.yview)
-    canv_all['yscrollcommand'] = scroll.set
+    def __init__(self) -> None:
+        """Create the chooser."""
+        super().__init__()
+        self.visible = False
+        self._close_event = trio.Event()
+        self._slots = {}
+        self._cur_style_id = PakRef(Style, packages.CLEAN_STYLE)
+        self.picker_slots = WidgetCache(self.ui_picker_create, self.ui_picker_hide)
 
-    name_label = ttk.Label(window, text='', justify='center')
-    frame_preview = ttk.Frame(window, relief='raised', borderwidth=4)
+    def style_changed(self, new_style_id: utils.ObjectID) -> None:
+        """Update the icons for the selected signage."""
+        self._cur_style_id = PakRef(Style, new_style_id)
+        if self.visible:
+            self.drag_man.load_icons()
 
-    frame_selected.grid(row=0, column=0, sticky='nsew')
-    ttk.Separator(orient='horizontal').grid(row=1, column=0, sticky='ew')
-    name_label.grid(row=2, column=0)
-    frame_preview.grid(row=3, column=0, pady=4)
-    canv_all.grid(row=0, column=1, rowspan=4, sticky='nsew')
-    scroll.grid(row=0, column=2, rowspan=4, sticky='ns')
-    window.columnconfigure(1, weight=1)
-    window.rowconfigure(3, weight=1)
+    def _get_drag_info(self, ref: SignRef) -> dragdrop.DragInfo:
+        """Get the icon for displaying this sign."""
+        packset = packages.get_loaded_packages()
+        style = self._cur_style_id.resolve(packset)
+        if style is None:
+            return dragdrop.DragInfo(IMG_ERROR)
 
-    tk_tools.add_mousewheel(canv_all, canv_all, window)
+        sign = ref.resolve(packages.get_loaded_packages())
+        if sign is None:
+            LOGGER.warning('No signage with id "{}"!', ref.id)
+            return dragdrop.DragInfo(IMG_ERROR)
+        return dragdrop.DragInfo(get_icon(sign, style))
 
-    preview_left = ttk.Label(frame_preview, anchor='e')
-    preview_right = ttk.Label(frame_preview, anchor='w')
-    img.apply(preview_left, IMG_BLANK)
-    img.apply(preview_right, IMG_BLANK)
-    preview_left.grid(row=0, column=0)
-    preview_right.grid(row=0, column=1)
+    def _evt_on_closed(self) -> None:
+        """Trigger a close."""
+        # Late binding!
+        self._close_event.set()
 
-    # Dummy initial parameter, will be overwritten. Allows us to stop the display when the mouse
-    # leaves.
-    hover_scope = trio.CancelScope()
+    async def task(self, trigger: async_util.EdgeTrigger[()]) -> None:
+        """Handles opening/closing the UI."""
+        # Alternate between showing and hiding.
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(self._apply_config_task)
+            nursery.start_soon(self._hovering_task)
+            nursery.start_soon(self.reposition_items_task)
+            nursery.start_soon(self._update_picker_items_task)
 
-    async def on_hover(hovered: dragdrop.Slot[Signage]) -> None:
-        """Show the signage when hovered, then toggle."""
-        nonlocal hover_scope
-        hover_sign = hovered.contents
-        if hover_sign is None:
-            await on_leave(hovered)
-            return
-        hover_scope.cancel()
-
-        localisation.set_text(name_label, TRANS_SIGN_NAME.format(name=hover_sign.name))
-
-        sng_left = hover_sign.dnd_icon
-        try:
-            sng_right = packages.LOADED.obj_by_id(Signage, 'SIGN_ARROW').dnd_icon
-        except KeyError:
-            LOGGER.warning('No arrow signage defined!')
-            sng_right = IMG_BLANK
-        try:
-            dbl_left = packages.LOADED.obj_by_id(Signage, hover_sign.prim_id or '').dnd_icon
-        except KeyError:
-            dbl_left = hover_sign.dnd_icon
-        try:
-            dbl_right = packages.LOADED.obj_by_id(Signage, hover_sign.sec_id or '').dnd_icon
-        except KeyError:
-            dbl_right = IMG_BLANK
-
-        with trio.CancelScope() as hover_scope:
             while True:
-                img.apply(preview_left, sng_left)
-                img.apply(preview_right, sng_right)
-                await trio.sleep(1.0)
-                img.apply(preview_left, dbl_left)
-                img.apply(preview_right, dbl_right)
-                await trio.sleep(1.0)
+                await trigger.wait()
+                self.drag_man.load_icons()
+                self.visible = True
+                self.ui_win_show()
 
-    async def on_leave(hovered: dragdrop.Slot[Signage]) -> None:
-        """Reset the visible sign when left."""
-        nonlocal hover_scope
-        name_label['text'] = ''
-        hover_scope.cancel()
-        img.apply(preview_left, IMG_BLANK)
-        img.apply(preview_right, IMG_BLANK)
+                await self._close_event.wait()
+                self._close_event = trio.Event()
 
-    drag_man.event_bus.register(dragdrop.Event.HOVER_ENTER, dragdrop.Slot[Signage], on_hover)
-    drag_man.event_bus.register(dragdrop.Event.HOVER_EXIT, dragdrop.Slot[Signage], on_leave)
+                # Store off the configured signage.
+                config.APP.store_conf(Layout({
+                    timer: slt.contents.id if slt.contents is not None else ''
+                    for timer, slt in self._slots.items()
+                }))
+                self.ui_win_hide()
+                self.drag_man.unload_icons()
+                self.visible = False
+                self.ui_set_preview_name(TransToken.BLANK)
+                self.ui_set_preview_img(IMG_BLANK, IMG_BLANK)
 
-    for i in SIGN_IND:
-        SLOTS_SELECTED[i] = slot = drag_man.slot_target(
-            frame_selected,
-            label=f'00:{i:02g}'
-        )
-        row, col = divmod(i-3, 4)
-        slot.grid(row=row, column=col, padx=1, pady=1)
+    def _create_chosen_slots(
+        self, parent_chosen: ParentT,
+    ) -> Iterator[tuple[int, int, SignSlot]]:
+        """Create the slots for the currently selected signage."""
+        trans_time = TransToken.untranslated('{delta:ms}')
+        for i in SIGN_IND:
+            self._slots[i] = slot = self.drag_man.slot_target(
+                parent_chosen,
+                label=trans_time.format(delta=timedelta(seconds=i)),
+            )
+            row, col = divmod(i-3, 4)
 
-        prev_id = DEFAULT_IDS.get(i, '')
-        if prev_id:
+            prev_id = DEFAULT_IDS.get(i, '')
+            if prev_id != "":
+                slot.contents = PakRef(Signage, prev_id)
+            yield row, col, slot
+
+    async def _update_picker_items_task(self) -> None:
+        """Create the slots for all possible signs."""
+        while True:
+            async with async_util.iterval_cancelling(packages.LOADED) as packset:
+                await packset.ready(Signage).wait()
+                self.picker_slots.reset()
+                for sign in sorted(packset.all_obj(Signage), key=lambda s: s.name):
+                    await trio.lowlevel.checkpoint()
+                    if not sign.hidden:
+                        self.picker_slots.fetch().contents = PakRef(Signage, utils.obj_id(sign.id))
+                self.picker_slots.hide_unused()
+                self.item_pos_dirty.set()
+
+    async def _apply_config_task(self) -> None:
+        """Apply saved signage info to the UI."""
+        data: Layout
+        with config.APP.get_ui_channel(Layout) as channel:
+            async for data in channel:
+                for timer in SIGN_IND:
+                    try:
+                        slot = self._slots[timer]
+                    except KeyError:
+                        LOGGER.warning('Invalid timer value {}!', timer)
+                        continue
+
+                    value = data.signs.get(timer, '')
+                    if value != "":
+                        slot.contents = PakRef(Signage, value)
+                    else:
+                        slot.contents = None
+
+    async def _hovering_task(self) -> None:
+        """Show the signage when hovered, then toggle."""
+        while True:
+            hover_sign_ref = await self.drag_man.hovered_item.wait_value(is_full)
+            packset = packages.get_loaded_packages()
+
+            hover_sign = hover_sign_ref.resolve(packset)
+            if hover_sign is None:
+                self.ui_set_preview_name(TRANS_UNKNOWN_SIGN.format(id=hover_sign_ref.id))
+                self.ui_set_preview_img(IMG_ERROR, IMG_ERROR)
+                await self.drag_man.hovered_item.wait_transition()
+                continue
+
+            self.ui_set_preview_name(TRANS_SIGN_NAME.format(name=hover_sign.name))
+
+            style = self._cur_style_id.resolve(packset)
+            if style is None:
+                LOGGER.warning('No such style: {}', self._cur_style_id)
+                self.ui_set_preview_img(IMG_ERROR, IMG_ERROR)
+                await self.drag_man.hovered_item.wait_transition()
+                continue
+
+            single_left = get_icon(hover_sign, style)
             try:
-                slot.contents = packages.LOADED.obj_by_id(Signage, prev_id)
+                single_right = get_icon(packset.obj_by_id(Signage, 'SIGN_ARROW'), style)
             except KeyError:
-                LOGGER.warning('Missing sign id: {}', prev_id)
+                LOGGER.warning('No arrow signage defined!')
+                single_right = IMG_BLANK
 
-    # TODO: Dynamically refresh this.
-    for sign in sorted(Signage.all(), key=lambda s: s.name):
-        if not sign.hidden:
-            slot = drag_man.slot_source(canv_all)
-            slot.contents = sign
+            double_left = single_left
+            double_right = IMG_BLANK
 
-    drag_man.flow_slots(canv_all, drag_man.sources())
-    canv_all.bind('<Configure>', lambda e: drag_man.flow_slots(canv_all, drag_man.sources()))
+            if hover_sign.prim_id:
+                try:
+                    double_left = get_icon(packset.obj_by_id(Signage, hover_sign.prim_id), style)
+                except KeyError:
+                    pass
 
-    def hide_window() -> None:
-        """Hide the window."""
-        # Store off the configured signage.
-        config.APP.store_conf(Layout({
-            timer: slt.contents.id if slt.contents is not None else ''
-            for timer, slt in SLOTS_SELECTED.items()
-        }))
-        window.withdraw()
-        drag_man.unload_icons()
-        img.apply(preview_left, IMG_BLANK)
-        img.apply(preview_right, IMG_BLANK)
+            if hover_sign.sec_id:
+                try:
+                    double_right = get_icon(packset.obj_by_id(Signage, hover_sign.sec_id), style)
+                except KeyError:
+                    pass
 
-    def show_window() -> None:
+            async with trio_util.move_on_when(self.drag_man.hovered_item.wait_transition) as scope:
+                # Will be cancelled anyway, the check ensures static analysis understands.
+                while not scope.cancel_called:
+                    self.ui_set_preview_img(single_left, single_right)
+                    await trio.sleep(1.0)
+                    self.ui_set_preview_img(double_left, double_right)
+                    await trio.sleep(1.0)
+            self.ui_set_preview_name(TransToken.BLANK)
+            self.ui_set_preview_img(IMG_BLANK, IMG_BLANK)
+
+    @abc.abstractmethod
+    def ui_win_show(self) -> None:
         """Show the window."""
-        drag_man.load_icons()
-        window.deiconify()
-        tk_tools.center_win(window, TK_ROOT)
+        raise NotImplementedError
 
-    window.protocol("WM_DELETE_WINDOW", hide_window)
-    await config.APP.set_and_run_ui_callback(Layout, apply_config)
+    @abc.abstractmethod
+    def ui_win_hide(self) -> None:
+        """Hide the window."""
+        raise NotImplementedError
 
-    show_btn = ttk.Button(master, command=show_window)
-    localisation.set_text(show_btn, TransToken.ui('Configure Signage'))
-    return show_btn
+    @abc.abstractmethod
+    def ui_set_preview_name(self, name: TransToken) -> None:
+        """Set the text for the preview."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def ui_set_preview_img(self, left: img.Handle, right: img.Handle) -> None:
+        """Set the images for the preview."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def ui_picker_create(self, index: int) -> SignSlot:
+        """Create a source slot, likely by calling dragdrop.slot_source."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def ui_picker_hide(self, slot: SignSlot) -> None:
+        """Hide the specified slot widget."""
+        raise NotImplementedError

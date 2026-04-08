@@ -1,57 +1,71 @@
-"""A Widget for allowing selecting a colour."""
-from __future__ import annotations
+"""A widget for allowing selecting a colour."""
 from tkinter import ttk
 from tkinter.colorchooser import askcolor
 import tkinter as tk
+from collections.abc import Mapping
+from contextlib import aclosing
 
-from srctools import Property
+from trio_util import AsyncValue
+import trio
 
-from app import img, tk_tools
-from app.itemconfig import (
-    UpdateFunc, WidgetLookup, WidgetLookupMulti,
-    multi_grid, parse_color, widget_sfx,
-)
-from app.tooltip import add_tooltip
+from app import img, itemconfig
 from app.localisation import TransToken
+from packages.widgets import KIND_COLOR, parse_color
+from ui_tk import tk_tools
+from ui_tk.img import TKImages
+from ui_tk.tooltip import add_tooltip
 
 
 TRANS_SELECT_TITLE = TransToken.ui('Choose a Color')
 
 
-@WidgetLookup('color', 'colour', 'rgb')
+@itemconfig.TK_IMPL.register_ui_single_no_conf(KIND_COLOR)
 async def widget_color_single(
-    parent: tk.Widget,
-    var: tk.StringVar,
-    conf: Property,
-) -> tuple[tk.Widget, UpdateFunc]:
+    parent: tk.Widget, tk_img: TKImages,
+    holder: AsyncValue[str],
+    /, *, task_status: trio.TaskStatus[tk.Widget] = trio.TASK_STATUS_IGNORED,
+) -> None:
     """Provides a colour swatch for specifying colours.
 
     Values can be provided as #RRGGBB, but will be written as 3 0-255 values.
     """
-    # Isolates the swatch so it doesn't resize.
+    # The frame isolates the swatch so that it doesn't resize.
     frame = ttk.Frame(parent)
-    swatch, update = make_color_swatch(frame, var, 24)
-    swatch.grid(row=0, column=0, sticky='w')
-    return frame, update
+    async with trio.open_nursery() as nursery:
+        swatch = await nursery.start(make_color_swatch, frame, tk_img, holder, 24)
+        swatch.grid(row=0, column=0, sticky='w')
+        task_status.started(swatch)
 
 
-@WidgetLookupMulti('color', 'colour', 'rgb')
-async def widget_color_multi(parent: tk.Widget, values: list[tuple[str, tk.StringVar]], conf: Property):
+@itemconfig.TK_IMPL.register_ui_multi_no_conf(KIND_COLOR)
+async def widget_color_multi(
+    parent: tk.Widget, tk_img: TKImages,
+    holders: Mapping[itemconfig.TimerNum, AsyncValue[str]],
+    /, *, task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED,
+) -> None:
     """For color swatches, display in a more compact form."""
-    for row, column, tim_val, tim_text, var in multi_grid(values):
-        swatch, update = make_color_swatch(parent, var, 16)
-        swatch.grid(row=row, column=column)
-        add_tooltip(swatch, tim_text, delay=0)
-        yield tim_val, update
+    async with trio.open_nursery() as nursery:
+        for row, column, tim_val, tim_text, holder in itemconfig.multi_grid(holders):
+            swatch = await nursery.start(make_color_swatch, parent, tk_img, holder, 16)
+            swatch.grid(row=row, column=column)
+            add_tooltip(swatch, tim_text, delay=0)
+        task_status.started()
 
 
-def make_color_swatch(parent: tk.Widget, var: tk.StringVar, size: int) -> tuple[tk.Widget, UpdateFunc]:
+async def make_color_swatch(
+    parent: tk.Widget, tk_img: TKImages,
+    holder: AsyncValue[str],
+    size: int,
+    /, *, task_status: trio.TaskStatus[tk.Widget] = trio.TASK_STATUS_IGNORED,
+) -> None:
     """Make a single swatch."""
+    swatch = ttk.Label(parent)
+
     # Note: tkinter requires RGB as ints, not float!
-    def open_win(e) -> None:
+    def open_win(e: tk.Event[ttk.Label]) -> None:
         """Display the color selection window."""
-        widget_sfx()
-        r, g, b = parse_color(var.get())
+        itemconfig.widget_sfx()
+        r, g, b = parse_color(holder.value)
         new_color, tk_color = askcolor(
             color=f"#{r:02x}{g:02x}{b:02x}",
             parent=parent.winfo_toplevel(),
@@ -60,14 +74,13 @@ def make_color_swatch(parent: tk.Widget, var: tk.StringVar, size: int) -> tuple[
         if new_color is not None:
             # On 3.8, these are floats.
             rf, gf, bf = new_color
-            var.set(f'{int(rf)} {int(gf)} {int(bf)}')
+            r, g, b = parsed = int(rf), int(gf), int(bf)
+            tk_img.apply(swatch, img.Handle.color(parsed, size, size))
+            holder.value = f'{r} {g} {b}'
 
-    swatch = ttk.Label(parent)
-    img.apply(swatch, img.Handle.color(parse_color(var.get()), size, size))
     tk_tools.bind_leftclick(swatch, open_win)
 
-    async def update_image(new_value: str) -> None:
-        """Update the image when changed."""
-        img.apply(swatch, img.Handle.color(parse_color(new_value), size, size))
-
-    return swatch, update_image
+    task_status.started(swatch)
+    async with aclosing(holder.eventual_values()) as agen:
+        async for value in agen:
+            tk_img.apply(swatch, img.Handle.color(parse_color(value), size, size))
